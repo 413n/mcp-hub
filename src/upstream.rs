@@ -10,7 +10,10 @@ use std::time::Duration;
 
 use rmcp::{
     RoleClient, ServiceError, ServiceExt,
-    model::{CallToolRequestParams, CallToolResponse, ClientCapabilities, ClientConfig, Implementation, Tool},
+    model::{
+        CallToolRequestParams, CallToolResponse, ClientCapabilities, ClientConfig, Implementation,
+        Tool,
+    },
     service::RunningService,
     transport::{
         StreamableHttpClientTransport, TokioChildProcess,
@@ -62,7 +65,11 @@ pub struct Upstream {
 
 impl Upstream {
     pub fn new(server: ServerConfig, store: SecretStore) -> Self {
-        Self { server, store, client: Mutex::new(None) }
+        Self {
+            server,
+            store,
+            client: Mutex::new(None),
+        }
     }
 
     pub fn name(&self) -> &str {
@@ -83,7 +90,10 @@ impl Upstream {
         if let Some(dir) = &stdio.cwd {
             // Checked here, as a missing cwd would otherwise be reported as a missing command.
             if !dir.is_dir() {
-                return Err(UpstreamError::Other(format!("cwd {} is not a directory", dir.display())));
+                return Err(UpstreamError::Other(format!(
+                    "cwd {} is not a directory",
+                    dir.display()
+                )));
             }
             cmd.current_dir(dir);
         }
@@ -107,11 +117,12 @@ impl Upstream {
             .stderr(Stdio::piped())
             .spawn()
             .map_err(|e| {
-                let hint = if e.kind() == std::io::ErrorKind::NotFound && !stdio.command.contains('/') {
-                    " (not in PATH: use an absolute path, or set PATH in the server's env)"
-                } else {
-                    ""
-                };
+                let hint =
+                    if e.kind() == std::io::ErrorKind::NotFound && !stdio.command.contains('/') {
+                        " (not in PATH: use an absolute path, or set PATH in the server's env)"
+                    } else {
+                        ""
+                    };
                 UpstreamError::Other(format!("cannot start {}: {e}{hint}", stdio.command))
             })?;
         let stderr = stderr.map(|s| tokio::spawn(log_stderr(name.clone(), s)));
@@ -137,28 +148,45 @@ impl Upstream {
         let other = |e: &dyn std::fmt::Display| UpstreamError::Other(e.to_string());
         let config = StreamableHttpClientTransportConfig::with_uri(url);
         let serving = match &self.server.auth {
-            Auth::None => client_info().serve(StreamableHttpClientTransport::from_config(config)).await,
+            Auth::None => {
+                client_info()
+                    .serve(StreamableHttpClientTransport::from_config(config))
+                    .await
+            }
             Auth::Bearer => {
-                let token = self.store.get(&format!("{name}:bearer")).await.map_err(|e| other(&e))?;
+                let token = self
+                    .store
+                    .get(&format!("{name}:bearer"))
+                    .await
+                    .map_err(|e| other(&e))?;
                 let Some(token) = token else {
                     return Err(UpstreamError::NeedsLogin(format!(
                         "no token stored, run \"mcp-hub set-token {name}\""
                     )));
                 };
-                let transport = StreamableHttpClientTransport::from_config(config.auth_header(token));
+                let transport =
+                    StreamableHttpClientTransport::from_config(config.auth_header(token));
                 client_info().serve(transport).await
             }
             Auth::OAuth { .. } => {
                 // Read the keyring fresh on every connect: `mcp-hub login` may have run meanwhile.
-                let mut manager = AuthorizationManager::new(url).await.map_err(|e| other(&e))?;
+                let mut manager = AuthorizationManager::new(url)
+                    .await
+                    .map_err(|e| other(&e))?;
                 manager.set_credential_store(KeyringCredentialStore::new(self.store.clone(), name));
-                if !manager.initialize_from_store().await.map_err(|e| other(&e))? {
+                if !manager
+                    .initialize_from_store()
+                    .await
+                    .map_err(|e| other(&e))?
+                {
                     return Err(UpstreamError::NeedsLogin(format!(
                         "not logged in, run \"mcp-hub login {name}\""
                     )));
                 }
                 let http = AuthClient::new(reqwest::Client::default(), manager);
-                client_info().serve(StreamableHttpClientTransport::with_client(http, config)).await
+                client_info()
+                    .serve(StreamableHttpClientTransport::with_client(http, config))
+                    .await
             }
         };
         serving.map_err(|e| {
@@ -255,7 +283,11 @@ impl Upstream {
 /// The line that most likely says why a process died: the last one mentioning an error
 /// (Node prints its stack after the message, Python before), else the last three.
 fn stderr_summary(tail: VecDeque<String>) -> String {
-    if let Some(line) = tail.iter().rev().find(|l| l.to_ascii_lowercase().contains("error")) {
+    if let Some(line) = tail
+        .iter()
+        .rev()
+        .find(|l| l.to_ascii_lowercase().contains("error"))
+    {
         return line.trim().to_owned();
     }
     let skip = tail.len().saturating_sub(3);

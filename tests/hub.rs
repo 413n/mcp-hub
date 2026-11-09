@@ -34,8 +34,10 @@ impl ServerHandler for Fake {
         _: Option<PaginatedRequestParams>,
         _: RequestContext<RoleServer>,
     ) -> Result<ListToolsResult, ErrorData> {
-        let tools = ["echo", "bad.name"]
-            .map(|name| serde_json::from_value(json!({"name": name, "inputSchema": {"type": "object"}})).unwrap());
+        let tools = ["echo", "bad.name"].map(|name| {
+            serde_json::from_value(json!({"name": name, "inputSchema": {"type": "object"}}))
+                .unwrap()
+        });
         Ok(ListToolsResult::with_all_items(tools.to_vec()))
     }
 
@@ -49,7 +51,9 @@ impl ServerHandler for Fake {
         }
         let args = serde_json::to_string(&req.arguments).unwrap();
         let text = format!("{}:{args}", req.name);
-        Ok(CallToolResponse::Complete(CallToolResult::success(vec![ContentBlock::text(text)])))
+        Ok(CallToolResponse::Complete(CallToolResult::success(vec![
+            ContentBlock::text(text),
+        ])))
     }
 }
 
@@ -60,7 +64,10 @@ async fn start_fake() -> u16 {
     config.legacy_session_mode = false;
     config.json_response = true;
     config.allowed_hosts = vec![format!("127.0.0.1:{port}")];
-    let service = Arc::new(StreamableHttpService::<Fake, rmcp::transport::streamable_http_server::session::local::LocalSessionManager>::new(|| Ok(Fake), Arc::default(), config));
+    let service = Arc::new(StreamableHttpService::<
+        Fake,
+        rmcp::transport::streamable_http_server::session::local::LocalSessionManager,
+    >::new(|| Ok(Fake), Arc::default(), config));
     tokio::spawn(async move {
         loop {
             let (stream, _) = listener.accept().await.unwrap();
@@ -95,7 +102,13 @@ async fn start_hub() -> u16 {
     )
     .unwrap();
     let store = SecretStore::memory();
-    let hub = Hub::new(config.servers.iter().map(|s| Upstream::new(s.clone(), store.clone())).collect());
+    let hub = Hub::new(
+        config
+            .servers
+            .iter()
+            .map(|s| Upstream::new(s.clone(), store.clone()))
+            .collect(),
+    );
     let listener = http::bind(0).await.unwrap();
     let port = listener.local_addr().unwrap().port();
     tokio::spawn(async move { http::serve(listener, hub, TOKEN, CancellationToken::new()).await });
@@ -116,10 +129,24 @@ async fn inbound_checks() {
     let port = start_hub().await;
     let bearer = format!("Bearer {TOKEN}");
     assert_eq!(raw(port, |r| r).await, 401, "no token");
-    assert_eq!(raw(port, |r| r.header("authorization", "Bearer wrong")).await, 401, "wrong token");
-    assert_eq!(raw(port, |r| r.header("authorization", &bearer).header("host", "evil.example")).await, 403, "host");
     assert_eq!(
-        raw(port, |r| r.header("authorization", &bearer).header("origin", "http://127.0.0.1:1")).await,
+        raw(port, |r| r.header("authorization", "Bearer wrong")).await,
+        401,
+        "wrong token"
+    );
+    assert_eq!(
+        raw(port, |r| r
+            .header("authorization", &bearer)
+            .header("host", "evil.example"))
+        .await,
+        403,
+        "host"
+    );
+    assert_eq!(
+        raw(port, |r| r
+            .header("authorization", &bearer)
+            .header("origin", "http://127.0.0.1:1"))
+        .await,
         403,
         "origin"
     );
@@ -131,7 +158,12 @@ async fn inbound_checks() {
         .unwrap()
         .status();
     assert_eq!(status, 405, "GET");
-    let status = reqwest::Client::new().post(format!("http://127.0.0.1:{port}/other")).send().await.unwrap().status();
+    let status = reqwest::Client::new()
+        .post(format!("http://127.0.0.1:{port}/other"))
+        .send()
+        .await
+        .unwrap()
+        .status();
     assert_eq!(status, 404, "path");
 }
 
@@ -139,12 +171,19 @@ async fn inbound_checks() {
 async fn proxies_tools() {
     let port = start_hub().await;
     let transport = StreamableHttpClientTransport::from_config(
-        StreamableHttpClientTransportConfig::with_uri(format!("http://127.0.0.1:{port}/mcp")).auth_header(TOKEN),
+        StreamableHttpClientTransportConfig::with_uri(format!("http://127.0.0.1:{port}/mcp"))
+            .auth_header(TOKEN),
     );
-    let client = mcp_hub::upstream::client_info().serve(transport).await.unwrap();
+    let client = mcp_hub::upstream::client_info()
+        .serve(transport)
+        .await
+        .unwrap();
 
     let instructions = client.peer_info().unwrap().instructions.clone().unwrap();
-    assert!(instructions.contains("- fake: Echoes things back"), "{instructions}");
+    assert!(
+        instructions.contains("- fake: Echoes things back"),
+        "{instructions}"
+    );
     assert!(instructions.contains("- sentry"), "{instructions}");
 
     // sentry is not logged in and bad.name is unusable; local is a child process.
@@ -157,20 +196,32 @@ async fn proxies_tools() {
     let result = client.call_tool(params).await.unwrap();
     assert_eq!(result.content[0].as_text().unwrap().text, r#"echo:{"x":1}"#);
 
-    let result = client.call_tool(CallToolRequestParams::new("local__env")).await.unwrap();
+    let result = client
+        .call_tool(CallToolRequestParams::new("local__env"))
+        .await
+        .unwrap();
     let text = &result.content[0].as_text().unwrap().text;
     assert!(text.ends_with(" secret=from-env"), "{text}");
 
     // Upstream JSON-RPC errors pass through.
-    let err = client.call_tool(CallToolRequestParams::new("fake__fail")).await.unwrap_err();
+    let err = client
+        .call_tool(CallToolRequestParams::new("fake__fail"))
+        .await
+        .unwrap_err();
     assert!(err.to_string().contains("upstream says no"), "{err}");
 
     // Unknown server or tool name.
-    let err = client.call_tool(CallToolRequestParams::new("nope__x")).await.unwrap_err();
+    let err = client
+        .call_tool(CallToolRequestParams::new("nope__x"))
+        .await
+        .unwrap_err();
     assert!(err.to_string().contains("Unknown tool"), "{err}");
 
     // Not logged in: a tool error the agent can read, not a protocol error.
-    let result = client.call_tool(CallToolRequestParams::new("sentry__whoami")).await.unwrap();
+    let result = client
+        .call_tool(CallToolRequestParams::new("sentry__whoami"))
+        .await
+        .unwrap();
     assert_eq!(result.is_error, Some(true));
     let text = &result.content[0].as_text().unwrap().text;
     assert!(text.contains("mcp-hub login sentry"), "{text}");

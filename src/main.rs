@@ -41,19 +41,26 @@ config: {}",
 }
 
 fn upstreams(config: &Config, store: &SecretStore) -> Vec<Upstream> {
-    config.servers.iter().map(|s| Upstream::new(s.clone(), store.clone())).collect()
+    config
+        .servers
+        .iter()
+        .map(|s| Upstream::new(s.clone(), store.clone()))
+        .collect()
 }
 
 /// The keyring may be locked or unreachable right after boot: wait for it instead of exiting.
 async fn wait_for_token(store: &SecretStore) -> String {
     let mut warned = false;
     loop {
-        let problem = match tokio::time::timeout(Duration::from_secs(120), store.get(TOKEN_KEY)).await {
-            Ok(Ok(Some(token))) => return token,
-            Ok(Ok(None)) => "no inbound token in the keyring yet (run \"mcp-hub token\")".to_owned(),
-            Ok(Err(e)) => format!("{e:#}"),
-            Err(_) => "keyring did not answer (locked?)".to_owned(),
-        };
+        let problem =
+            match tokio::time::timeout(Duration::from_secs(120), store.get(TOKEN_KEY)).await {
+                Ok(Ok(Some(token))) => return token,
+                Ok(Ok(None)) => {
+                    "no inbound token in the keyring yet (run \"mcp-hub token\")".to_owned()
+                }
+                Ok(Err(e)) => format!("{e:#}"),
+                Err(_) => "keyring did not answer (locked?)".to_owned(),
+            };
         if !warned {
             tracing::warn!("{problem}; retrying every 10s");
             warned = true;
@@ -68,9 +75,20 @@ async fn serve(config: Config, store: SecretStore) -> Result<()> {
         .with_context(|| format!("cannot listen on 127.0.0.1:{}", config.port))?;
     let token = wait_for_token(&store).await;
     let hub = Hub::new(upstreams(&config, &store));
-    let names: Vec<_> = hub.upstreams().iter().map(|u| u.name().to_owned()).collect();
+    let names: Vec<_> = hub
+        .upstreams()
+        .iter()
+        .map(|u| u.name().to_owned())
+        .collect();
     tracing::info!("mcp-hub listening on http://127.0.0.1:{}/mcp", config.port);
-    tracing::info!("upstreams: {}", if names.is_empty() { "(none)".into() } else { names.join(", ") });
+    tracing::info!(
+        "upstreams: {}",
+        if names.is_empty() {
+            "(none)".into()
+        } else {
+            names.join(", ")
+        }
+    );
 
     let shutdown = CancellationToken::new();
     let signal = shutdown.clone();
@@ -111,12 +129,17 @@ async fn status(config: Config, store: SecretStore) -> Result<bool> {
 }
 
 async fn token(store: SecretStore, rotate: bool) -> Result<()> {
-    let existing = if rotate { None } else { store.get(TOKEN_KEY).await? };
+    let existing = if rotate {
+        None
+    } else {
+        store.get(TOKEN_KEY).await?
+    };
     let value = match existing {
         Some(v) => v,
         None => {
             let mut bytes = [0u8; 32];
-            getrandom::fill(&mut bytes).map_err(|e| anyhow::anyhow!("no system randomness: {e}"))?;
+            getrandom::fill(&mut bytes)
+                .map_err(|e| anyhow::anyhow!("no system randomness: {e}"))?;
             let v = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes);
             store.set(TOKEN_KEY, &v).await?;
             v
@@ -137,7 +160,12 @@ fn read_secret(prompt: &str) -> Result<String> {
     }
 }
 
-async fn set_token(config: Config, store: SecretStore, name: &str, var: Option<&str>) -> Result<()> {
+async fn set_token(
+    config: Config,
+    store: SecretStore,
+    name: &str,
+    var: Option<&str>,
+) -> Result<()> {
     let server = config.server(name)?;
     let secret_env = match &server.endpoint {
         Endpoint::Stdio(stdio) => stdio.secret_env.as_slice(),
@@ -145,10 +173,15 @@ async fn set_token(config: Config, store: SecretStore, name: &str, var: Option<&
     };
     let (key, what) = match var {
         None if server.auth == Auth::Bearer => (format!("{name}:bearer"), "token".to_owned()),
-        Some(var) if secret_env.iter().any(|v| v == var) => (secret_env_key(name, var), var.to_owned()),
+        Some(var) if secret_env.iter().any(|v| v == var) => {
+            (secret_env_key(name, var), var.to_owned())
+        }
         Some(_) if server.auth == Auth::Bearer => bail!("usage: mcp-hub set-token {name}"),
         _ if !secret_env.is_empty() => {
-            bail!("usage: mcp-hub set-token {name} <VAR>, with VAR one of: {}", secret_env.join(", "))
+            bail!(
+                "usage: mcp-hub set-token {name} <VAR>, with VAR one of: {}",
+                secret_env.join(", ")
+            )
         }
         _ => bail!("server \"{name}\" is not configured with \"bearer\": true or \"secretEnv\""),
     };
@@ -167,7 +200,10 @@ async fn set_token(config: Config, store: SecretStore, name: &str, var: Option<&
         }
     }
     if !missing.is_empty() {
-        println!("Stored {what} for {name}. Still to set: {}.", missing.join(", "));
+        println!(
+            "Stored {what} for {name}. Still to set: {}.",
+            missing.join(", ")
+        );
         return Ok(());
     }
     let upstream = Upstream::new(server.clone(), store.clone());
@@ -231,7 +267,11 @@ async fn run(args: &[String]) -> Result<ExitCode> {
 
 fn init_logging(serving: bool) {
     use tracing_subscriber::EnvFilter;
-    let default = if serving { "info,rmcp=warn" } else { "warn,rmcp=error" };
+    let default = if serving {
+        "info,rmcp=warn"
+    } else {
+        "warn,rmcp=error"
+    };
     let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(default));
     let builder = tracing_subscriber::fmt()
         .with_env_filter(filter)

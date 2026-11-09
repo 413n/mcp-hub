@@ -14,7 +14,8 @@ const REPO: &str = "413n/mcp-hub";
 pub const CURRENT: &str = env!("CARGO_PKG_VERSION");
 
 fn releases_url() -> String {
-    std::env::var("MCP_HUB_RELEASES").unwrap_or_else(|_| format!("https://github.com/{REPO}/releases"))
+    std::env::var("MCP_HUB_RELEASES")
+        .unwrap_or_else(|_| format!("https://github.com/{REPO}/releases"))
 }
 
 /// "1.2.3" or "v1.2.3" → (1, 2, 3); pre-release or build suffixes are ignored.
@@ -36,13 +37,21 @@ fn http() -> Result<reqwest::Client> {
 /// The latest release's version, from the redirect of `<releases>/latest` to `.../tag/v<version>`.
 pub async fn latest_version() -> Result<String> {
     let url = format!("{}/latest", releases_url());
-    let res = http()?.get(&url).send().await.with_context(|| format!("cannot reach {url}"))?;
+    let res = http()?
+        .get(&url)
+        .send()
+        .await
+        .with_context(|| format!("cannot reach {url}"))?;
     let location = res
         .headers()
         .get(reqwest::header::LOCATION)
         .and_then(|l| l.to_str().ok())
         .with_context(|| format!("no release found at {url} (HTTP {})", res.status()))?;
-    let version = location.rsplit('/').next().unwrap_or_default().trim_start_matches('v');
+    let version = location
+        .rsplit('/')
+        .next()
+        .unwrap_or_default()
+        .trim_start_matches('v');
     if parse_version(version).is_none() {
         bail!("unexpected latest-release redirect: {location}");
     }
@@ -51,7 +60,9 @@ pub async fn latest_version() -> Result<String> {
 
 /// Where install.sh puts the binary.
 fn installer_bin() -> PathBuf {
-    let home = std::env::var_os("HOME").map(PathBuf::from).unwrap_or_default();
+    let home = std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .unwrap_or_default();
     home.join(".local").join("bin").join("mcp-hub")
 }
 
@@ -71,9 +82,14 @@ fn check_installed_by_installer() -> Result<()> {
 
 async fn run_installer(version: &str) -> Result<()> {
     // The installer from the target release's tag, so script and archives match.
-    let url = std::env::var("MCP_HUB_INSTALL_SCRIPT")
-        .unwrap_or_else(|_| format!("https://raw.githubusercontent.com/{REPO}/v{version}/install.sh"));
-    let res = http()?.get(&url).send().await.with_context(|| format!("cannot download {url}"))?;
+    let url = std::env::var("MCP_HUB_INSTALL_SCRIPT").unwrap_or_else(|_| {
+        format!("https://raw.githubusercontent.com/{REPO}/v{version}/install.sh")
+    });
+    let res = http()?
+        .get(&url)
+        .send()
+        .await
+        .with_context(|| format!("cannot download {url}"))?;
     if !res.status().is_success() {
         bail!("cannot download {url}: HTTP {}", res.status());
     }
@@ -84,7 +100,11 @@ async fn run_installer(version: &str) -> Result<()> {
         .stdin(Stdio::piped())
         .spawn()
         .context("cannot run /bin/sh")?;
-    child.stdin.take().expect("piped stdin").write_all(&script)?;
+    child
+        .stdin
+        .take()
+        .expect("piped stdin")
+        .write_all(&script)?;
     let status = child.wait()?;
     if !status.success() {
         bail!("installer failed ({status})");

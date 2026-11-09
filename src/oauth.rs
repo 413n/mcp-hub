@@ -6,7 +6,9 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use rmcp::transport::auth::{AuthError, CredentialRefreshGuard, CredentialStore, StoredCredentials};
+use rmcp::transport::auth::{
+    AuthError, CredentialRefreshGuard, CredentialStore, StoredCredentials,
+};
 use tokio::sync::Mutex;
 
 use crate::config::{Endpoint, ServerConfig};
@@ -24,7 +26,11 @@ fn store_err(e: anyhow::Error) -> AuthError {
 
 impl KeyringCredentialStore {
     pub fn new(store: SecretStore, server: &str) -> Self {
-        Self { store, key: format!("{server}:oauth"), refresh_lock: Arc::default() }
+        Self {
+            store,
+            key: format!("{server}:oauth"),
+            refresh_lock: Arc::default(),
+        }
     }
 }
 
@@ -35,7 +41,10 @@ impl CredentialStore for KeyringCredentialStore {
     }
 
     async fn save(&self, credentials: StoredCredentials) -> Result<(), AuthError> {
-        self.store.set_json(&self.key, &credentials).await.map_err(store_err)
+        self.store
+            .set_json(&self.key, &credentials)
+            .await
+            .map_err(store_err)
     }
 
     async fn clear(&self) -> Result<(), AuthError> {
@@ -72,10 +81,20 @@ mod tests {
         let store = SecretStore::memory();
         let s = KeyringCredentialStore::new(store.clone(), "s");
         assert!(s.load().await.unwrap().is_none());
-        s.save(StoredCredentials::new("client".into(), None, vec!["a".into()], Some(1))).await.unwrap();
+        s.save(StoredCredentials::new(
+            "client".into(),
+            None,
+            vec!["a".into()],
+            Some(1),
+        ))
+        .await
+        .unwrap();
         assert!(store.get("s:oauth").await.unwrap().is_some());
         let creds = s.load().await.unwrap().unwrap();
-        assert_eq!((creds.client_id.as_str(), creds.granted_scopes.as_slice()), ("client", ["a".to_owned()].as_slice()));
+        assert_eq!(
+            (creds.client_id.as_str(), creds.granted_scopes.as_slice()),
+            ("client", ["a".to_owned()].as_slice())
+        );
         s.clear().await.unwrap();
         assert!(s.load().await.unwrap().is_none());
     }

@@ -115,7 +115,9 @@ mod os {
             return Ok(None);
         };
         let secret = item.get_secret().await?;
-        Ok(Some(String::from_utf8(secret).context("secret is not UTF-8")?))
+        Ok(Some(
+            String::from_utf8(secret).context("secret is not UTF-8")?,
+        ))
     }
 
     pub async fn set(key: &str, value: &str) -> Result<()> {
@@ -125,7 +127,13 @@ mod os {
             collection.unlock().await.context("keyring is locked")?;
         }
         collection
-            .create_item(&format!("mcp-hub: {key}"), attrs(key), value.as_bytes(), true, "text/plain")
+            .create_item(
+                &format!("mcp-hub: {key}"),
+                attrs(key),
+                value.as_bytes(),
+                true,
+                "text/plain",
+            )
             .await?;
         Ok(())
     }
@@ -155,14 +163,18 @@ mod os {
     const SERVICE: &str = "mcp-hub";
     const NOT_FOUND: i32 = -25300; // errSecItemNotFound
 
-    async fn blocking<T: Send + 'static>(f: impl FnOnce() -> Result<T> + Send + 'static) -> Result<T> {
+    async fn blocking<T: Send + 'static>(
+        f: impl FnOnce() -> Result<T> + Send + 'static,
+    ) -> Result<T> {
         tokio::task::spawn_blocking(f).await?
     }
 
     pub async fn get(key: &str) -> Result<Option<String>> {
         let key = key.to_owned();
         blocking(move || match get_generic_password(SERVICE, &key) {
-            Ok(bytes) => Ok(Some(String::from_utf8(bytes).context("secret is not UTF-8")?)),
+            Ok(bytes) => Ok(Some(
+                String::from_utf8(bytes).context("secret is not UTF-8")?,
+            )),
             Err(e) if e.code() == NOT_FOUND => Ok(None),
             Err(e) => Err(anyhow!("keychain get {key} failed: {e}")),
         })
@@ -210,7 +222,12 @@ mod tests {
 
     #[test]
     fn keys() {
-        for ok in ["hub:inbound-token", "sentry:oauth", "a", "my-server.v2:bearer"] {
+        for ok in [
+            "hub:inbound-token",
+            "sentry:oauth",
+            "a",
+            "my-server.v2:bearer",
+        ] {
             assert!(check_key(ok).is_ok(), "{ok}");
         }
         for bad in ["", ":x", "A", "a b", "a/b", &"a".repeat(129)] {
