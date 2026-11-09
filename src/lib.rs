@@ -7,6 +7,7 @@ pub mod hub;
 pub mod login;
 pub mod oauth;
 pub mod secrets;
+pub mod update;
 pub mod upstream;
 
 /// Keyring key of the bearer token agents use to reach the hub.

@@ -12,6 +12,7 @@ use mcp_hub::{
     login::login,
     oauth::credential_keys,
     secrets::SecretStore,
+    update,
     upstream::Upstream,
 };
 use tokio_util::sync::CancellationToken;
@@ -27,6 +28,9 @@ fn usage() -> String {
   status              connect to every upstream and count its tools
   token               print the inbound bearer token, creating it if needed
   token --rotate      replace the inbound token (update your agent configs after)
+  update              update to the latest release (installs made by install.sh)
+  update --check      only check whether a newer release exists
+  update <version>    install that version (also to go back)
   --version           print the version
 
 config: {}",
@@ -185,6 +189,9 @@ async fn run(args: &[String]) -> Result<ExitCode> {
         }
         (Some("token"), None) => token(store, false).await?,
         (Some("token"), Some("--rotate")) => token(store, true).await?,
+        (Some("update"), None) => update::update(None, false).await?,
+        (Some("update"), Some("--check")) => update::update(None, true).await?,
+        (Some("update"), Some(version)) => update::update(Some(version), false).await?,
         (Some("--version" | "version"), None) => println!("mcp-hub {}", env!("CARGO_PKG_VERSION")),
         _ => {
             eprintln!("{}", usage());

@@ -5,7 +5,8 @@
 #
 # Downloads the latest release (or $MCP_HUB_VERSION, e.g. "0.1.0"), verifies its
 # SHA-256 checksum, installs the binary to ~/.local/bin and starts the hub as a
-# per-user service (systemd on Linux, launchd on macOS). Run it again to update.
+# per-user service (systemd on Linux, launchd on macOS). Update later with
+# `mcp-hub update` (or run this again).
 # Your config and keyring entries are never touched.
 set -eu
 

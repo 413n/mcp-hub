@@ -29,8 +29,8 @@ normal desktop session.
 verifies its SHA-256 checksum, installs the binary to `~/.local/bin/mcp-hub`,
 creates an empty config and the hub token if missing, and starts the service.
 No Rust needed; the macOS build is a universal binary (Apple Silicon and Intel).
-Run the same command again to update; pin a version with
-`curl -fsSL .../install.sh | MCP_HUB_VERSION=0.1.0 sh`. Your config and keyring
+Update later with `mcp-hub update` (or run the same command again); pin a
+version with `curl -fsSL .../install.sh | MCP_HUB_VERSION=0.1.0 sh`. Your config and keyring
 entries are never touched. Add `~/.local/bin` to your `PATH` to run `mcp-hub`
 directly (the rest of this README assumes it).
 
@@ -178,14 +178,18 @@ reconnect; Cursor: toggle the server in settings).
     mcp-hub logout <server>    # delete stored credentials for a server
     mcp-hub set-token <server> # static token for a "bearer" server
     mcp-hub token [--rotate]   # print (or replace) the hub token
+    mcp-hub update [--check]   # update to the latest release (one-line installs)
+    mcp-hub update <version>   # install a specific version, e.g. to go back
 
 Restart after editing the config:
 
     systemctl --user restart mcp-hub                     # Linux
     launchctl kickstart -k gui/$(id -u)/dev.mcp-hub      # macOS
 
-Update: run the one-line installer again, or `bin/install-service.sh` after
-`git pull` in a clone.
+Update: `mcp-hub update` for one-line installs (it runs that release's
+`install.sh`: checksum check, binary swap, service restart; config, logins and
+token stay). For a clone: `git pull && bin/install-service.sh`. On macOS the
+Keychain may ask once more after an update: choose *Always Allow*.
 
 Logs (`RUST_LOG=debug` in the service environment for more detail):
 
