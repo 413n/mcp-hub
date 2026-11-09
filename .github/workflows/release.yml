@@ -1,0 +1,144 @@
+# Manual release: Actions → Release → Run workflow
+# (or: gh workflow run release.yml -R 413n/mcp-hub).
+#
+# Publishes GitHub Release v<version> (version from Cargo.toml) with one archive
+# per platform. Flow: create a draft release → build, test and upload on each
+# platform in parallel → publish. A published release is never overwritten:
+# bump the version in Cargo.toml to release again. A draft left behind by a
+# failed run is replaced automatically on the next run.
+#
+# Artifacts go straight to the release with the preinstalled gh CLI, so jobs
+# share nothing through actions/upload-artifact.
+name: Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      prerelease:
+        description: Mark the release as a pre-release
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+  GH_TOKEN: ${{ github.token }}
+  GH_REPO: ${{ github.repository }}
+
+jobs:
+  draft:
+    name: Create draft release
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    outputs:
+      tag: ${{ steps.draft.outputs.tag }}
+      version: ${{ steps.draft.outputs.version }}
+    steps:
+      # Only Cargo.toml is needed here: read it through the API instead of checking out.
+      - id: draft
+        run: |
+          version="$(gh api "repos/$GH_REPO/contents/Cargo.toml?ref=$GITHUB_SHA" --jq .content \
+            | base64 -d | sed -n 's/^version = "\(.*\)"$/\1/p' | head -n 1)"
+          [[ -n "$version" ]] || { echo "::error::no version in Cargo.toml"; exit 1; }
+          tag="v$version"
+          if draft="$(gh release view "$tag" --json isDraft --jq .isDraft 2>/dev/null)"; then
+            if [[ "$draft" != "true" ]]; then
+              echo "::error::release $tag is already published; bump the version in Cargo.toml first"
+              exit 1
+            fi
+            echo "Replacing draft $tag left by an earlier run"
+            gh release delete "$tag" --yes
+          fi
+          gh release create "$tag" --draft --target "$GITHUB_SHA" \
+            --title "mcp-hub $version" --generate-notes
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
+  build:
+    name: Build ${{ matrix.name }}
+    needs: draft
+    strategy:
+      fail-fast: true
+      matrix:
+        include:
+          # Built on the oldest supported Ubuntu so the binary's glibc needs stay low.
+          - name: linux-x86_64
+            os: ubuntu-24.04
+            targets: x86_64-unknown-linux-gnu
+          # Universal binary: Apple Silicon and Intel.
+          - name: macos-universal
+            os: macos-26
+            targets: aarch64-apple-darwin x86_64-apple-darwin
+    runs-on: ${{ matrix.os }}
+    permissions:
+      contents: write
+    env:
+      DIST: mcp-hub-${{ needs.draft.outputs.version }}-${{ matrix.name }}
+      TARGETS: ${{ matrix.targets }}
+      TAG: ${{ needs.draft.outputs.tag }}
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install Rust
+        run: |
+          rustup toolchain install stable --profile minimal --no-self-update
+          rustup default stable
+          read -ra targets <<< "$TARGETS"
+          rustup target add "${targets[@]}"
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.name }}
+
+      # Tests and the build share one release-profile dependency build per target.
+      - name: Test
+        run: cargo test --release --locked --target "${TARGETS%% *}"
+
+      - name: Build
+        run: |
+          args=()
+          for t in $TARGETS; do args+=(--target "$t"); done
+          cargo build --release --locked "${args[@]}"
+
+      - name: Assemble binary
+        run: |
+          bins=()
+          for t in $TARGETS; do bins+=("target/$t/release/mcp-hub"); done
+          if [[ "$RUNNER_OS" == macOS ]]; then
+            lipo -create -output mcp-hub "${bins[@]}"
+            # Ad-hoc signature: required to run on Apple Silicon.
+            codesign --force --sign - mcp-hub
+            lipo -info mcp-hub
+          else
+            cp "${bins[0]}" mcp-hub
+          fi
+          ./mcp-hub --version
+
+      - name: Package and upload
+        run: |
+          mkdir -p "$DIST/systemd" "$DIST/launchd"
+          cp mcp-hub bin/install-service.sh README.md config.example.json "$DIST/"
+          cp systemd/mcp-hub.service.in "$DIST/systemd/"
+          cp launchd/dev.mcp-hub.plist.in "$DIST/launchd/"
+          tar -czf "$DIST.tar.gz" "$DIST"
+          shasum -a 256 "$DIST.tar.gz" > "$DIST.tar.gz.sha256"
+          gh release upload "$TAG" "$DIST.tar.gz" "$DIST.tar.gz.sha256" --clobber
+
+  publish:
+    name: Publish release
+    needs: [draft, build]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - env:
+          TAG: ${{ needs.draft.outputs.tag }}
+          PRERELEASE: ${{ inputs.prerelease }}
+        run: gh release edit "$TAG" --draft=false --prerelease="$PRERELEASE"

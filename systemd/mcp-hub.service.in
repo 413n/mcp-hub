@@ -1,0 +1,17 @@
+[Unit]
+Description=mcp-hub: localhost MCP proxy
+# Needs the user D-Bus session for the GNOME keyring.
+After=dbus.socket
+Requires=dbus.socket
+
+[Service]
+ExecStart=@BIN@ serve
+Restart=on-failure
+RestartSec=5
+NoNewPrivileges=yes
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+LockPersonality=yes
+UMask=0077
+
+[Install]
+WantedBy=default.target

@@ -1,0 +1,47 @@
+[package]
+name = "mcp-hub"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.88"
+description = "Personal localhost MCP proxy: one URL, many upstream MCP servers, credentials in the OS keyring"
+publish = false
+
+[dependencies]
+rmcp = { version = "=3.9.0", default-features = false, features = [
+    "client",
+    "server",
+    "auth",
+    "reqwest",
+    "transport-streamable-http-client-reqwest",
+    "transport-streamable-http-server",
+] }
+anyhow = "1"
+async-trait = "0.1"
+base64 = "0.22"
+bytes = "1"
+futures = "0.3"
+getrandom = "0.3"
+http-body-util = "0.1"
+hyper = { version = "1", features = ["server", "http1"] }
+hyper-util = { version = "0.1", features = ["tokio"] }
+reqwest = { version = "0.13", default-features = false }
+rpassword = "7"
+serde = { version = "1", features = ["derive"] }
+serde_json = { version = "1", features = ["preserve_order"] }
+sha2 = "0.10"
+subtle = "2"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "signal", "time", "sync"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["fmt", "env-filter"] }
+url = "2"
+thiserror = "2"
+tokio-util = "0.7"
+
+[target.'cfg(target_os = "linux")'.dependencies]
+secret-service = { version = "5.2", features = ["rt-tokio-crypto-rust"] }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+security-framework = "3"
+
+[profile.release]
+strip = true
