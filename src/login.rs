@@ -14,7 +14,7 @@ use tokio::net::TcpListener;
 use tokio::sync::mpsc;
 use url::Url;
 
-use crate::config::{Auth, Config};
+use crate::config::{Auth, Config, Endpoint};
 use crate::oauth::KeyringCredentialStore;
 use crate::secrets::SecretStore;
 use crate::upstream::Upstream;
@@ -105,12 +105,12 @@ fn open_browser(url: &str) -> Result<()> {
 
 pub async fn login(config: &Config, store: &SecretStore, name: &str) -> Result<()> {
     let server = config.server(name)?;
-    let Auth::OAuth { client_id, scope } = &server.auth else {
+    let (Auth::OAuth { client_id, scope }, Endpoint::Http(url)) = (&server.auth, &server.endpoint) else {
         bail!("server \"{name}\" is not configured for OAuth");
     };
     let redirect = format!("http://127.0.0.1:{}/callback", config.login_port);
 
-    let mut manager = AuthorizationManager::new(server.url.as_str()).await?;
+    let mut manager = AuthorizationManager::new(url.as_str()).await?;
     manager.set_credential_store(KeyringCredentialStore::new(store.clone(), name));
     let mut oauth = OAuthState::Unauthorized(manager);
     let mut request = AuthorizationRequest::new(&redirect).with_client_name("mcp-hub (local)");

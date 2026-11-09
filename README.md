@@ -1,16 +1,17 @@
 # mcp-hub
 
 Personal MCP proxy: one URL (`http://127.0.0.1:3050/mcp`) for Claude Code, Codex
-and Cursor, fanning out to several upstream MCP servers. You log in to each
+and Cursor, fanning out to several upstream MCP servers: remote ones over HTTP
+and local ones the hub starts as stdio processes. You log in to each
 upstream once, in the hub, and every agent gets all of their tools through a
 single connection. Tools appear as `<server>__<tool>`, e.g. `sentry__search_issues`.
 
 A single Rust binary built on the official MCP Rust SDK
 ([`rmcp`](https://github.com/modelcontextprotocol/rust-sdk)). Deliberately small:
-no dashboard, no admin API, no stdio servers, no runtime reconfiguration.
+no dashboard, no admin API, no runtime reconfiguration.
 Stateless towards the agents, and it passes upstream results through without
 re-validating them, so memory stays flat (about 10 MB idle, under 100 MB while
-serving large tool lists).
+serving large tool lists; stdio servers are processes of their own on top).
 
 Runs on Linux (GNOME keyring, systemd) and macOS (Keychain, launchd). Each
 machine is independent: only the code is shared through this repo. The config,
@@ -147,6 +148,9 @@ Edit `~/.config/mcp-hub/config.json` and add an entry under `servers`
       }
     }
 
+Each server is either a `url` (an HTTP server, below) or a `command` (a local
+stdio server, see [Local (stdio) servers](#local-stdio-servers)).
+
 - `url`: `https`, or `http` on loopback (`127.0.0.1`, `localhost`) only.
 - `description`: agents see it in the hub's MCP instructions and use it to
   decide when to look for that server's tools. Keep it short and concrete.
@@ -171,12 +175,56 @@ Then restart the hub and check it:
 Agents pick up the new tools on their next session (Claude Code: `/mcp` →
 reconnect; Cursor: toggle the server in settings).
 
+### Local (stdio) servers
+
+A server with a `command` instead of a `url` is a program the hub starts itself
+and talks to over stdin/stdout, as an agent would. The same entry you would give
+an agent works, with a `description` added:
+
+    "profilery": {
+      "command": "/Users/me/.vite-plus/js_runtime/node/24.14.0/bin/node",
+      "args": ["--import", "file:///Users/me/Code/profilery/node_modules/tsx/dist/loader.mjs", "src/mcp/main.ts"],
+      "cwd": "/Users/me/Code/profilery",
+      "env": { "LOG_LEVEL": "warn" },
+      "description": "My profile: projects, skills, certifications, trainings, languages"
+    }
+
+- `command`: an absolute path, or a program name looked up in `PATH`.
+  (`"type": "stdio"`, as agents' configs often have, is accepted and ignored.)
+- `args`, `env`, `cwd` (absolute): optional. `env` is added to the hub's own
+  environment.
+- `secretEnv`: optional list of environment variables whose values are kept in
+  the keyring instead of the config, e.g. `"secretEnv": ["GITHUB_TOKEN"]`.
+  Store each with `mcp-hub set-token <name> <VAR>` (input hidden).
+
+**`PATH` is minimal.** The service does not load your shell profile, so it
+typically sees only system directories such as `/usr/bin` and `/bin`: Homebrew,
+nvm, `npx`, `uvx` and the like are not found. Give `command` as an absolute path
+and, for launchers that start other programs (`npx` needs `node`), set
+`"env": { "PATH": "/opt/homebrew/bin:/usr/bin:/bin" }`, which is used for the
+lookup too.
+
+How it runs:
+
+- Started on first use, shared by every agent, and restarted on the next request
+  if it exits. It runs in its own process group, so stopping it also stops
+  anything it started.
+- It runs in `cwd` (else the hub's directory), not in the agent's project, and
+  agents' MCP roots are not forwarded. Servers meant to work on "the current
+  repo" (filesystem, git) are better configured in each agent directly.
+- Its stderr goes to the hub's log, one line per message prefixed with the
+  server name. If it fails to start, `mcp-hub status` shows the error line it
+  printed last.
+- `oauth` and `bearer` do not apply; servers that need a login of their own
+  usually keep it in their own files.
+
 ## Day to day
 
     mcp-hub status             # can every upstream be reached?
     mcp-hub login <server>     # OAuth login in the browser (also to re-login)
     mcp-hub logout <server>    # delete stored credentials for a server
     mcp-hub set-token <server> # static token for a "bearer" server
+    mcp-hub set-token <server> <VAR>  # a "secretEnv" value for a local server
     mcp-hub token [--rotate]   # print (or replace) the hub token
     mcp-hub update [--check]   # update to the latest release (one-line installs)
     mcp-hub update <version>   # install a specific version, e.g. to go back
@@ -191,12 +239,15 @@ Update: `mcp-hub update` for one-line installs (it runs that release's
 token stay). For a clone: `git pull && bin/install-service.sh`. On macOS the
 Keychain may ask once more after an update: choose *Always Allow*.
 
-Logs (`RUST_LOG=debug` in the service environment for more detail):
+Logs (`RUST_LOG=debug` in the service environment for more detail; local
+servers' stderr is logged at `info` under the target `mcp_hub::stderr`, so
+`RUST_LOG=info,mcp_hub::stderr=warn` silences it):
 
     journalctl --user -u mcp-hub -f                     # Linux
     tail -f ~/Library/Logs/mcp-hub.log                   # macOS
 
-Upstream logins (`login`, `set-token`) are picked up without a restart. Config
+Upstream logins (`login`, `set-token`) are picked up without a restart (a local
+server that is already running keeps its environment until it restarts). Config
 changes and `token --rotate` need one.
 
 ### Troubleshooting
@@ -206,6 +257,13 @@ changes and `token --rotate` need one.
   is stale: copy the current one from `mcp-hub token`.
 - **One server missing**: `mcp-hub status`. A `FAIL` saying to log in means its
   login is missing or expired: run `login` (or `set-token`) again.
+- **Local server FAIL "cannot start"**: the `command` path is wrong, or a bare
+  name is not in the service's `PATH` (see [Local (stdio) servers](#local-stdio-servers)).
+  "connection closed: initialize response" means it started but exited: the
+  `stderr:` part of the message usually says why.
+- **Local server works in a terminal but not in the hub (Linux)**: the systemd
+  unit restricts sockets to IPv4, IPv6 and Unix ones (`RestrictAddressFamilies`),
+  and the server inherits that.
 - **Log says it is waiting for the keyring**: unlock the keyring (log in to the
   desktop session); the hub retries every 10 seconds.
 - **Port in use**: change `port` (and the URL in every agent) or `loginPort` in
@@ -218,7 +276,8 @@ changes and `token --rotate` need one.
 - Service, Linux: `~/.config/systemd/user/mcp-hub.service`, generated from `systemd/`
 - Service, macOS: `~/Library/LaunchAgents/dev.mcp-hub.plist`, generated from `launchd/`
 - Code: `src/http.rs` (inbound checks), `src/hub.rs` (tool merging and routing),
-  `src/upstream.rs`, `src/oauth.rs`, `src/login.rs`, `src/secrets.rs` (keyring)
+  `src/upstream.rs` (HTTP and stdio upstreams), `src/oauth.rs`, `src/login.rs`,
+  `src/secrets.rs` (keyring)
 
 ## Security model
 
@@ -233,13 +292,17 @@ changes and `token --rotate` need one.
   machines.
 - The agents' config files do contain the hub token, which only grants access to
   this localhost endpoint.
+- Local servers run as you, with the hub's environment plus their `env`: anyone
+  who can edit the config can run commands as you (as with any agent's MCP
+  config). Put tokens in `secretEnv` rather than `env`, which is plain text in
+  the config file.
 - The keyring is readable by any process running as you while you are logged in
   (on macOS, other apps get a prompt). It protects against disk theft and stray
   files, not against your own user.
 
 ## Development
 
-    cargo test                 # unit tests + end-to-end test with a fake upstream
+    cargo test                 # unit tests + end-to-end tests with fake HTTP and stdio upstreams
     cargo clippy --all-targets
 
 ### Releasing

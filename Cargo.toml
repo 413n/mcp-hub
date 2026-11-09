@@ -14,6 +14,7 @@ rmcp = { version = "=3.9.0", default-features = false, features = [
     "reqwest",
     "transport-streamable-http-client-reqwest",
     "transport-streamable-http-server",
+    "transport-child-process",
 ] }
 anyhow = "1"
 async-trait = "0.1"
@@ -30,12 +31,13 @@ serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["preserve_order"] }
 sha2 = "0.10"
 subtle = "2"
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "signal", "time", "sync"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "signal", "time", "sync", "process", "io-util"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["fmt", "env-filter"] }
 url = "2"
 thiserror = "2"
 tokio-util = "0.7"
+process-wrap = { version = "10", default-features = false, features = ["tokio1", "process-group"] }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 secret-service = { version = "5.2", features = ["rt-tokio-crypto-rust"] }

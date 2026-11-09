@@ -6,11 +6,11 @@ use anyhow::{Context, Result, bail};
 use base64::Engine;
 use mcp_hub::{
     TOKEN_KEY,
-    config::{Auth, Config, config_path, load_config},
+    config::{Auth, Config, Endpoint, config_path, load_config},
     http,
     hub::Hub,
     login::login,
-    oauth::credential_keys,
+    oauth::{credential_keys, secret_env_key},
     secrets::SecretStore,
     update,
     upstream::Upstream,
@@ -25,6 +25,8 @@ fn usage() -> String {
   login <server>      log in to an OAuth upstream (opens your browser)
   logout <server>     delete stored credentials for a server
   set-token <server>  store a static bearer token (prompted, not echoed) for a \"bearer\" server
+  set-token <server> <VAR>
+                      store the value of VAR, one of a command server's \"secretEnv\" (same way)
   status              connect to every upstream and count its tools
   token               print the inbound bearer token, creating it if needed
   token --rotate      replace the inbound token (update your agent configs after)
@@ -135,24 +137,45 @@ fn read_secret(prompt: &str) -> Result<String> {
     }
 }
 
-async fn set_token(config: Config, store: SecretStore, name: &str) -> Result<()> {
+async fn set_token(config: Config, store: SecretStore, name: &str, var: Option<&str>) -> Result<()> {
     let server = config.server(name)?;
-    if server.auth != Auth::Bearer {
-        bail!("server \"{name}\" is not configured with \"bearer\": true");
+    let secret_env = match &server.endpoint {
+        Endpoint::Stdio(stdio) => stdio.secret_env.as_slice(),
+        Endpoint::Http(_) => &[],
+    };
+    let (key, what) = match var {
+        None if server.auth == Auth::Bearer => (format!("{name}:bearer"), "token".to_owned()),
+        Some(var) if secret_env.iter().any(|v| v == var) => (secret_env_key(name, var), var.to_owned()),
+        Some(_) if server.auth == Auth::Bearer => bail!("usage: mcp-hub set-token {name}"),
+        _ if !secret_env.is_empty() => {
+            bail!("usage: mcp-hub set-token {name} <VAR>, with VAR one of: {}", secret_env.join(", "))
+        }
+        _ => bail!("server \"{name}\" is not configured with \"bearer\": true or \"secretEnv\""),
+    };
+    let value = read_secret(&format!("{name} {what} (input hidden): "))?;
+    // Bearer tokens go in an HTTP header; an environment variable may hold anything but empty.
+    if value.is_empty() || (var.is_none() && value.chars().any(char::is_whitespace)) {
+        bail!("empty or malformed value, nothing stored");
     }
-    let value = read_secret(&format!("Token for {name} (input hidden): "))?;
-    if value.is_empty() || value.chars().any(char::is_whitespace) {
-        bail!("empty or malformed token, nothing stored");
-    }
-    let key = format!("{name}:bearer");
     let previous = store.get(&key).await?;
     store.set(&key, &value).await?;
+
+    let mut missing = Vec::new();
+    for v in secret_env {
+        if store.get(&secret_env_key(name, v)).await?.is_none() {
+            missing.push(v.as_str());
+        }
+    }
+    if !missing.is_empty() {
+        println!("Stored {what} for {name}. Still to set: {}.", missing.join(", "));
+        return Ok(());
+    }
     let upstream = Upstream::new(server.clone(), store.clone());
     let result = upstream.list_tools().await;
     upstream.close().await;
     match result {
         Ok(tools) => {
-            println!("Token stored for {name}: {} tools available.", tools.len());
+            println!("Stored {what} for {name}: {} tools available.", tools.len());
             Ok(())
         }
         Err(e) => {
@@ -160,14 +183,13 @@ async fn set_token(config: Config, store: SecretStore, name: &str) -> Result<()>
                 Some(p) => store.set(&key, &p).await?,
                 None => store.delete(&key).await?,
             }
-            bail!("token rejected, nothing stored ({e})")
+            bail!("{name} failed with this value, nothing stored ({e})")
         }
     }
 }
 
 async fn logout(config: Config, store: SecretStore, name: &str) -> Result<()> {
-    config.server(name)?;
-    for key in credential_keys(name) {
+    for key in credential_keys(config.server(name)?) {
         store.delete(&key).await?;
     }
     println!("Removed stored credentials for {name}.");
@@ -177,11 +199,17 @@ async fn logout(config: Config, store: SecretStore, name: &str) -> Result<()> {
 async fn run(args: &[String]) -> Result<ExitCode> {
     let store = SecretStore::os();
     let arg = args.get(1).map(String::as_str);
+    if let [cmd, name, var] = args
+        && cmd == "set-token"
+    {
+        set_token(load_config()?, store, name, Some(var)).await?;
+        return Ok(ExitCode::SUCCESS);
+    }
     match (args.first().map(String::as_str), arg) {
         (Some("serve"), None) => serve(load_config()?, store).await?,
         (Some("login"), Some(name)) => login(&load_config()?, &store, name).await?,
         (Some("logout"), Some(name)) => logout(load_config()?, store, name).await?,
-        (Some("set-token"), Some(name)) => set_token(load_config()?, store, name).await?,
+        (Some("set-token"), Some(name)) => set_token(load_config()?, store, name, None).await?,
         (Some("status"), None) => {
             if !status(load_config()?, store).await? {
                 return Ok(ExitCode::FAILURE);

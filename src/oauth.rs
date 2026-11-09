@@ -9,6 +9,7 @@ use async_trait::async_trait;
 use rmcp::transport::auth::{AuthError, CredentialRefreshGuard, CredentialStore, StoredCredentials};
 use tokio::sync::Mutex;
 
+use crate::config::{Endpoint, ServerConfig};
 use crate::secrets::SecretStore;
 
 pub struct KeyringCredentialStore {
@@ -47,9 +48,19 @@ impl CredentialStore for KeyringCredentialStore {
     }
 }
 
+/// Keyring entry holding the value of `var`, one of a command server's `secretEnv`.
+pub fn secret_env_key(server: &str, var: &str) -> String {
+    format!("{server}:env:{}", var.to_ascii_lowercase())
+}
+
 /// Every keyring entry that holds credentials for `server`.
-pub fn credential_keys(server: &str) -> [String; 2] {
-    [format!("{server}:oauth"), format!("{server}:bearer")]
+pub fn credential_keys(server: &ServerConfig) -> Vec<String> {
+    let name = &server.name;
+    let mut keys = vec![format!("{name}:oauth"), format!("{name}:bearer")];
+    if let Endpoint::Stdio(stdio) = &server.endpoint {
+        keys.extend(stdio.secret_env.iter().map(|var| secret_env_key(name, var)));
+    }
+    keys
 }
 
 #[cfg(test)]

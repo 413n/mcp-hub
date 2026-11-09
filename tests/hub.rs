@@ -85,6 +85,11 @@ async fn start_hub() -> u16 {
         &json!({"servers": {
             "fake": {"url": format!("http://127.0.0.1:{fake_port}/mcp"), "description": "Echoes things back"},
             "sentry": {"url": "https://mcp.sentry.dev/mcp", "oauth": {}},
+            "local": {
+                "command": "/bin/sh",
+                "args": [concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/stdio-server.sh")],
+                "env": {"FAKE_SECRET": "from-env"},
+            },
         }})
         .to_string(),
     )
@@ -142,14 +147,19 @@ async fn proxies_tools() {
     assert!(instructions.contains("- fake: Echoes things back"), "{instructions}");
     assert!(instructions.contains("- sentry"), "{instructions}");
 
-    // sentry is not logged in and bad.name is unusable: only fake__echo remains.
+    // sentry is not logged in and bad.name is unusable; local is a child process.
     let tools = client.list_all_tools().await.unwrap();
-    assert_eq!(tools.iter().map(|t| t.name.as_ref()).collect::<Vec<_>>(), ["fake__echo"]);
+    let names: Vec<_> = tools.iter().map(|t| t.name.as_ref()).collect();
+    assert_eq!(names, ["fake__echo", "local__env", "local__crash"]);
 
     let mut params = CallToolRequestParams::new("fake__echo");
     params.arguments = Some(json!({"x": 1}).as_object().unwrap().clone());
     let result = client.call_tool(params).await.unwrap();
     assert_eq!(result.content[0].as_text().unwrap().text, r#"echo:{"x":1}"#);
+
+    let result = client.call_tool(CallToolRequestParams::new("local__env")).await.unwrap();
+    let text = &result.content[0].as_text().unwrap().text;
+    assert!(text.ends_with(" secret=from-env"), "{text}");
 
     // Upstream JSON-RPC errors pass through.
     let err = client.call_tool(CallToolRequestParams::new("fake__fail")).await.unwrap_err();
