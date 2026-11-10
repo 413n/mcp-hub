@@ -8,7 +8,7 @@ use base64::Engine;
 use mcp_hub::{
     TOKEN_KEY,
     config::{Auth, Config, Endpoint, config_path, load_config},
-    http,
+    connect, http,
     hub::Hub,
     login::login,
     oauth::{credential_keys, secret_env_key},
@@ -30,7 +30,9 @@ fn usage() -> String {
                       store the value of VAR, one of a command server's \"secretEnv\" (same way)
   status              connect to every upstream and count its tools
   token               print the inbound bearer token, creating it if needed
-  token --rotate      replace the inbound token (update your agent configs after)
+  token --rotate      replace the inbound token (then restart the hub)
+  connect             for an agent's config: MCP on stdin/stdout, forwarded to the running hub
+  headers             for an agent's config: print the HTTP headers to send to the hub, as JSON
   update              update to the latest release (installs made by install.sh)
   update --check      only check whether a newer release exists
   update <version>    install that version (also to go back)
@@ -253,6 +255,18 @@ async fn run(args: &[String]) -> Result<ExitCode> {
         }
         (Some("token"), None) => token(store, false).await?,
         (Some("token"), Some("--rotate")) => token(store, true).await?,
+        (Some("connect"), None) => {
+            let port = load_config()?.port;
+            connect::run(port, store, tokio::io::stdin(), tokio::io::stdout()).await?
+        }
+        (Some("headers"), None) => {
+            let headers: serde_json::Map<String, serde_json::Value> = connect::headers(&store)
+                .await?
+                .into_iter()
+                .map(|(name, value)| (name.to_owned(), value.into()))
+                .collect();
+            println!("{}", serde_json::Value::Object(headers));
+        }
         (Some("update"), None) => update::update(None, false).await?,
         (Some("update"), Some("--check")) => update::update(None, true).await?,
         (Some("update"), Some(version)) => update::update(Some(version), false).await?,
@@ -286,13 +300,49 @@ fn init_logging(serving: bool) {
     }
 }
 
-// Two workers: the hub mostly waits on sockets, and with glibc every extra worker thread
-// keeps its own malloc arena, each holding on to the memory of the largest burst it served.
-#[tokio::main(flavor = "multi_thread", worker_threads = 2)]
-async fn main() -> ExitCode {
+/// Agents may start `mcp-hub connect` with a bare environment (Codex passes on a handful of
+/// variables), and the keyring is reached over the session bus: point at the usual socket.
+#[cfg(target_os = "linux")]
+fn find_session_bus() {
+    if std::env::var_os("DBUS_SESSION_BUS_ADDRESS").is_some() {
+        return;
+    }
+    let dir = match std::env::var_os("XDG_RUNTIME_DIR") {
+        Some(dir) => std::path::PathBuf::from(dir),
+        // SAFETY: getuid has no preconditions and cannot fail.
+        None => format!("/run/user/{}", unsafe { libc::getuid() }).into(),
+    };
+    let bus = dir.join("bus");
+    if bus.exists() {
+        // SAFETY: called first thing in main, before any other thread exists.
+        unsafe {
+            std::env::set_var(
+                "DBUS_SESSION_BUS_ADDRESS",
+                format!("unix:path={}", bus.display()),
+            )
+        };
+    }
+}
+
+fn main() -> ExitCode {
+    #[cfg(target_os = "linux")]
+    find_session_bus();
     let args: Vec<String> = std::env::args().skip(1).collect();
-    init_logging(args.first().map(String::as_str) == Some("serve"));
-    match run(&args).await {
+    let command = args.first().map(String::as_str);
+    init_logging(command == Some("serve"));
+    let mut runtime = if matches!(command, Some("connect" | "headers")) {
+        // One of these runs per agent session: keep it to a single thread.
+        tokio::runtime::Builder::new_current_thread()
+    } else {
+        // Two workers: the hub mostly waits on sockets, and with glibc every extra worker
+        // thread keeps its own malloc arena, each holding on to the memory of the largest
+        // burst it served.
+        let mut runtime = tokio::runtime::Builder::new_multi_thread();
+        runtime.worker_threads(2);
+        runtime
+    };
+    let runtime = runtime.enable_all().build().expect("tokio runtime");
+    match runtime.block_on(run(&args)) {
         Ok(code) => code,
         Err(e) => {
             eprintln!("mcp-hub: {e:#}");

@@ -2,6 +2,7 @@
 //! several upstream MCP servers, with credentials in the OS keyring.
 
 pub mod config;
+pub mod connect;
 pub mod http;
 pub mod hub;
 pub mod login;

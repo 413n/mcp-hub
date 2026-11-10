@@ -68,18 +68,25 @@ macOS, so it asks again once after every `install-service.sh`.
 
 ## 2. Connect your agents
 
-Every agent connects to the same URL with the same header:
+The hub listens at `http://127.0.0.1:3050/mcp` and wants its token on every
+request (`Authorization: Bearer <token>`). So that the token does not have to
+sit in each agent's config file, `mcp-hub` hands it over itself, read from the
+keyring:
 
-    URL:     http://127.0.0.1:3050/mcp
-    Header:  Authorization: Bearer <token>
+- `mcp-hub headers` prints the headers as JSON, for agents that can run a
+  command to get them (Claude Code).
+- `mcp-hub connect` is a small stdio MCP server that forwards everything to the
+  running hub, for the others (Codex, Cursor).
 
-`<token>` is the output of `mcp-hub token`. Register the hub once per agent;
-servers you add to the hub later show up without touching the agents again.
+Register the hub once per agent; servers you add to the hub later show up
+without touching the agents again. The commands below write the full path of
+`mcp-hub` into the agent's config, since agents are not always started with your
+shell's `PATH`.
 
 ### Claude Code
 
-    claude mcp add --scope user --transport http hub http://127.0.0.1:3050/mcp \
-      --header "Authorization: Bearer $(mcp-hub token)"
+    claude mcp add-json --scope user hub \
+      "{\"type\":\"http\",\"url\":\"http://127.0.0.1:3050/mcp\",\"headersHelper\":\"$(command -v mcp-hub) headers\"}"
 
 `--scope user` makes it available in every project (stored in `~/.claude.json`).
 Check with `claude mcp list` or `/mcp` inside a session. Tools are named
@@ -87,20 +94,15 @@ Check with `claude mcp list` or `/mcp` inside a session. Tools are named
 
 ### Codex
 
-Add to `~/.codex/config.toml`:
+    codex mcp add hub -- "$(command -v mcp-hub)" connect
+
+which writes this to `~/.codex/config.toml`:
 
     [mcp_servers.hub]
-    url = "http://127.0.0.1:3050/mcp"
-    http_headers = { Authorization = "Bearer <token>" }
+    command = "/home/you/.local/bin/mcp-hub"
+    args = ["connect"]
 
-Or append it from the shell:
-
-    printf '\n[mcp_servers.hub]\nurl = "http://127.0.0.1:3050/mcp"\nhttp_headers = { Authorization = "Bearer %s" }\n' \
-      "$(mcp-hub token)" >> ~/.codex/config.toml
-
-Check with `codex mcp list`. (`codex mcp add --url` only supports reading the
-token from an environment variable, which apps started outside a shell do not
-see, so the header goes in the file.)
+Check with `codex mcp list`.
 
 ### Cursor
 
@@ -109,8 +111,8 @@ Add to `~/.cursor/mcp.json` (global, all projects); create the file if missing:
     {
       "mcpServers": {
         "hub": {
-          "url": "http://127.0.0.1:3050/mcp",
-          "headers": { "Authorization": "Bearer <token>" }
+          "command": "/home/you/.local/bin/mcp-hub",
+          "args": ["connect"]
         }
       }
     }
@@ -119,13 +121,20 @@ If the file already has other servers, add only the `"hub"` entry inside
 `mcpServers`. Then open Cursor Settings → MCP (Tools & Integrations) and check
 that `hub` is enabled and lists its tools.
 
+### Any other agent
+
+Give it `mcp-hub connect` as a stdio server. If it only speaks HTTP, give it the
+URL and the header `Authorization: Bearer <token>`, with the output of
+`mcp-hub token` for `<token>`; that copy of the token is then yours to update.
+
 ### Rotating the token
 
     mcp-hub token --rotate
 
-Then restart the hub (see "Day to day") and put the new token in all three
-agent configs: re-run the `claude mcp add` line (after `claude mcp remove --scope user hub`),
-and edit `~/.codex/config.toml` and `~/.cursor/mcp.json`.
+Then restart the hub (see "Day to day"). Agents set up as above need no change:
+`connect` reads the new token by itself, and Claude Code asks `headers` again
+when a session starts. Only a config that holds the token itself has to be
+edited.
 
 ## 3. Add upstream servers
 
@@ -265,6 +274,8 @@ How it runs:
     mcp-hub set-token <server> # static token for a "bearer" server
     mcp-hub set-token <server> <VAR>  # a "secretEnv" value for a local server
     mcp-hub token [--rotate]   # print (or replace) the hub token
+    mcp-hub connect            # what agents run: MCP on stdin/stdout, forwarded to the hub
+    mcp-hub headers            # what agents run: the HTTP headers for the hub, as JSON
     mcp-hub update [--check]   # update to the latest release (one-line installs)
     mcp-hub update <version>   # install a specific version, e.g. to go back
 
@@ -293,7 +304,8 @@ changes and `token --rotate` need one.
 
 - **Agent shows no hub tools**: `curl` check from step 1. No answer means the
   service is not running: check the logs. `401` from the agent means its token
-  is stale: copy the current one from `mcp-hub token`.
+  is stale: restart the hub if you rotated the token, and if the agent's config
+  holds the token itself, copy the current one from `mcp-hub token`.
 - **One server missing**: `mcp-hub status`. A `FAIL` saying to log in means its
   login is missing or expired: run `login` (or `set-token`) again.
 - **Local server FAIL "cannot start"**: the `command` path is wrong, or a bare
@@ -320,6 +332,7 @@ changes and `token --rotate` need one.
 - Service, Linux: `~/.config/systemd/user/mcp-hub.service`, generated from `systemd/`
 - Service, macOS: `~/Library/LaunchAgents/dev.mcp-hub.plist`, generated from `launchd/`
 - Code: `src/http.rs` (inbound checks), `src/hub.rs` (tool merging and routing),
+  `src/connect.rs` (what agents run to reach the hub),
   `src/upstream.rs` (HTTP and stdio upstreams), `src/oauth.rs`, `src/login.rs`,
   `src/secrets.rs` (keyring)
 
@@ -334,8 +347,10 @@ changes and `token --rotate` need one.
   `key`), on macOS the login Keychain (generic passwords, service `mcp-hub`).
   Nothing secret is written to disk by mcp-hub, and nothing is synced between
   machines.
-- The agents' config files do contain the hub token, which only grants access to
-  this localhost endpoint.
+- The hub token only grants access to this localhost endpoint. Agents set up
+  with `mcp-hub connect` or `mcp-hub headers` get it from the keyring each time,
+  so it is in none of their config files, where a search or a pasted config
+  would show it.
 - Local servers run as you, with the hub's environment plus their `env`: anyone
   who can edit the config can run commands as you (as with any agent's MCP
   config). Put tokens in `secretEnv` rather than `env`, which is plain text in

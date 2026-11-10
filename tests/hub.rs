@@ -302,3 +302,56 @@ async fn caches_tool_lists() {
     tokio::time::sleep(Duration::from_millis(1200)).await;
     assert_eq!(counts(), (2, 2));
 }
+
+/// `mcp-hub connect`: an agent talks MCP over a pipe, and the token comes from the keyring.
+#[tokio::test]
+async fn connects_over_stdio() {
+    let port = start_hub().await;
+    let store = SecretStore::memory();
+    store.set(mcp_hub::TOKEN_KEY, TOKEN).await.unwrap();
+    let (agent, bridge) = tokio::io::duplex(1 << 16);
+    let (input, output) = tokio::io::split(bridge);
+    tokio::spawn(mcp_hub::connect::run(port, store.clone(), input, output));
+
+    let client = mcp_hub::upstream::client_info().serve(agent).await.unwrap();
+    let instructions = client.peer_info().unwrap().instructions.clone().unwrap();
+    assert!(instructions.contains("- fake"), "{instructions}");
+    let tools = client.list_all_tools().await.unwrap();
+    assert_eq!(tools.len(), 3);
+    let mut params = CallToolRequestParams::new("fake__echo");
+    params.arguments = Some(json!({"x": 1}).as_object().unwrap().clone());
+    let result = client.call_tool(params).await.unwrap();
+    assert_eq!(result.content[0].as_text().unwrap().text, r#"echo:{"x":1}"#);
+    let err = client
+        .call_tool(CallToolRequestParams::new("fake__fail"))
+        .await
+        .unwrap_err();
+    assert!(err.to_string().contains("upstream says no"), "{err}");
+
+    client.cancel().await.unwrap();
+
+    // A wrong token is reported, not hung on.
+    store
+        .set(mcp_hub::TOKEN_KEY, "not-the-token")
+        .await
+        .unwrap();
+    let (agent, bridge) = tokio::io::duplex(1 << 16);
+    let (input, output) = tokio::io::split(bridge);
+    tokio::spawn(mcp_hub::connect::run(port, store.clone(), input, output));
+    let err = mcp_hub::upstream::client_info().serve(agent).await.err();
+    assert!(
+        err.as_ref()
+            .is_some_and(|e| format!("{e:?}").contains("refused the token")),
+        "{err:?}"
+    );
+
+    // A token rotated after the bridge started is read again.
+    let (agent, bridge) = tokio::io::duplex(1 << 16);
+    let (input, output) = tokio::io::split(bridge);
+    tokio::spawn(mcp_hub::connect::run(port, store.clone(), input, output));
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    store.set(mcp_hub::TOKEN_KEY, TOKEN).await.unwrap();
+    let client = mcp_hub::upstream::client_info().serve(agent).await.unwrap();
+    assert_eq!(client.list_all_tools().await.unwrap().len(), 3);
+    client.cancel().await.unwrap();
+}
