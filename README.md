@@ -76,12 +76,12 @@ request (`Authorization: Bearer <token>`). So that the token does not have to
 sit in each agent's config file, `mcp-hub` hands it over itself, read from the
 keyring:
 
-- `mcp-hub headers` prints the headers as JSON, for agents that can run a
-  command to get them (Claude Code).
 - `mcp-hub connect` is a small stdio MCP server that forwards everything to the
-  running hub, for the others (Codex, Cursor, Claude Desktop). It also tells the
+  running hub (Claude Code, Codex, Cursor, Claude Desktop). It also tells the
   agent when the hub's tools change (`notifications/tools/list_changed`), as when
   a slow server comes up after the agent first asked.
+- `mcp-hub headers` prints the headers as JSON, for agents that talk HTTP and can
+  run a command to get them (Claude Code also can).
 
 Register the hub once per agent; servers you add to the hub later show up
 without touching the agents again. The commands below write the full path of
@@ -90,10 +90,17 @@ shell's `PATH`.
 
 ### Claude Code
 
+    claude mcp add --scope user hub -- "$(command -v mcp-hub)" connect
+
+`--scope user` makes it available in every project (stored in `~/.claude.json`).
+Talking HTTP to the hub directly also works, but then Claude Code does not hear
+when tools arrive late (as just after the hub restarts):
+
     claude mcp add-json --scope user hub \
       "{\"type\":\"http\",\"url\":\"http://127.0.0.1:3050/mcp\",\"headersHelper\":\"$(command -v mcp-hub) headers\"}"
 
-`--scope user` makes it available in every project (stored in `~/.claude.json`).
+To switch, `claude mcp remove --scope user hub` first.
+
 Check with `claude mcp list` or `/mcp` inside a session. Tools are named
 `mcp__hub__<server>__<tool>`.
 
