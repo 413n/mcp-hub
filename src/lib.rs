@@ -7,6 +7,7 @@ pub mod http;
 pub mod hub;
 pub mod login;
 pub mod oauth;
+pub mod results;
 pub mod secrets;
 pub mod stats;
 pub mod update;

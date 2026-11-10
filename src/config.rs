@@ -33,7 +33,16 @@ pub struct ServerConfig {
     /// Descriptions of this server's tools and their parameters are cut to about this many
     /// characters. `None` leaves them as they are.
     pub max_description: Option<usize>,
+    /// A tool result larger than this many characters is kept in a file, and the agent
+    /// gets where it is and how it starts. `None` passes every result on whole.
+    pub max_result: Option<usize>,
+    /// Drop the empty fields (null, "", [], {}) from JSON results.
+    pub compact_results: bool,
 }
+
+/// Unless `maxResult` says otherwise: about 10,000 tokens. Agents have limits of their own,
+/// but higher ones (Claude Code keeps results over 25,000 tokens in a file).
+const DEFAULT_MAX_RESULT: usize = 40_000;
 
 /// Unless `maxDescription` says otherwise. Few descriptions are longer; one that is can
 /// cost an agent thousands of tokens each time it loads the tool.
@@ -109,6 +118,10 @@ struct RawConfig {
     login_port: Option<u16>,
     /// Characters; 0 for no limit. Each server can set its own.
     max_description: Option<usize>,
+    /// Characters; 0 for no limit. Each server can set its own.
+    max_result: Option<usize>,
+    /// Each server can say otherwise.
+    compact_results: Option<bool>,
     #[serde(default)]
     servers: serde_json::Map<String, serde_json::Value>,
 }
@@ -130,6 +143,8 @@ struct RawServer {
     idle_timeout: Option<u64>,
     skip_when_env: Option<String>,
     max_description: Option<usize>,
+    max_result: Option<usize>,
+    compact_results: Option<bool>,
     description: Option<String>,
     oauth: Option<RawOAuth>,
     bearer: Option<bool>,
@@ -235,6 +250,12 @@ pub fn parse_config(text: &str) -> Result<Config> {
         max => Ok(max),
     };
     let default_max = max_description("", raw.max_description)?;
+    // Shorter than this and a result would hardly say what it is about.
+    let max_result = |at: &str, max: Option<usize>| match max {
+        Some(1..1000) => bail!("{at}maxResult: expected 0 (no limit) or at least 1000"),
+        max => Ok(max),
+    };
+    let default_max_result = max_result("", raw.max_result)?;
 
     let mut servers = Vec::new();
     for (name, value) in raw.servers {
@@ -252,6 +273,11 @@ pub fn parse_config(text: &str) -> Result<Config> {
         let max = max_description(&format!("{at}."), s.max_description.take())?;
         let max_description = Some(max.or(default_max).unwrap_or(DEFAULT_MAX_DESCRIPTION));
         let max_description = max_description.filter(|max| *max > 0);
+        let max = max_result(&format!("{at}."), s.max_result.take())?;
+        let max_result = Some(max.or(default_max_result).unwrap_or(DEFAULT_MAX_RESULT));
+        let max_result = max_result.filter(|max| *max > 0);
+        let compact_results = s.compact_results.take();
+        let compact_results = compact_results.or(raw.compact_results).unwrap_or(false);
         let skip_when_env = s.skip_when_env.take();
         if let Some(var) = &skip_when_env
             && !valid_secret_env_name(var)
@@ -315,6 +341,8 @@ pub fn parse_config(text: &str) -> Result<Config> {
             idle_timeout,
             skip_when_env,
             max_description,
+            max_result,
+            compact_results,
         });
     }
     Ok(Config {
@@ -409,6 +437,28 @@ mod tests {
         assert_eq!(max, [Some(500), None, Some(9000)]);
         let c = parse_config(r#"{"servers":{"a":{"url":"https://a/"}}}"#).unwrap();
         assert_eq!(c.servers[0].max_description, Some(DEFAULT_MAX_DESCRIPTION));
+    }
+
+    #[test]
+    fn results() {
+        let c = parse_config(
+            r#"{"compactResults":true,"maxResult":5000,"servers":{
+                "a":{"url":"https://a/"},"b":{"url":"https://b/","maxResult":0,"compactResults":false}
+            }}"#,
+        )
+        .unwrap();
+        let got: Vec<_> = c
+            .servers
+            .iter()
+            .map(|s| (s.max_result, s.compact_results))
+            .collect();
+        assert_eq!(got, [(Some(5000), true), (None, false)]);
+        let c = parse_config(r#"{"servers":{"a":{"url":"https://a/"}}}"#).unwrap();
+        let a = &c.servers[0];
+        assert_eq!(
+            (a.max_result, a.compact_results),
+            (Some(DEFAULT_MAX_RESULT), false)
+        );
     }
 
     #[test]
@@ -533,6 +583,14 @@ mod tests {
             (
                 r#"{"servers":{"hub":{"url":"https://x/"}}}"#,
                 "the hub's own name",
+            ),
+            (
+                r#"{"servers":{"a":{"url":"https://x/","maxResult":10}}}"#,
+                "maxResult too small to be of use",
+            ),
+            (
+                r#"{"servers":{"a":{"url":"https://x/","compactResults":"yes"}}}"#,
+                "compactResults not a boolean",
             ),
             (r#"{"port":3050,"loginPort":3050}"#, "same ports"),
             (r#"{"port":80}"#, "privileged port"),

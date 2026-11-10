@@ -1,6 +1,7 @@
 //! Merges the tools of several upstreams under "<server>__<tool>" names.
 
 use std::collections::HashMap;
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -206,6 +207,8 @@ fn describe_tool() -> Tool {
 pub struct Hub {
     upstreams: Arc<Vec<Arc<Upstream>>>,
     stats: Stats,
+    /// Where results too large to pass on whole are kept for the agent to read.
+    results: Arc<PathBuf>,
 }
 
 /// How much a tool call returned, for the record: characters of text, and bytes of
@@ -238,7 +241,38 @@ impl Hub {
         Self {
             upstreams: Arc::new(upstreams),
             stats,
+            results: Arc::new(crate::stats::state_dir().join("results")),
         }
+    }
+
+    /// Keep results too large to pass on whole in `dir` instead of the usual place.
+    pub fn keeping_results_in(mut self, dir: PathBuf) -> Self {
+        self.results = Arc::new(dir);
+        self
+    }
+
+    /// What the server's config says to do to a result before passing it on. Returns, for
+    /// the record, the size the result had if it was kept in a file, and how many
+    /// characters dropping empty fields saved.
+    fn shrink(
+        &self,
+        upstream: &Upstream,
+        tool: &str,
+        result: &mut CallToolResult,
+    ) -> (Option<usize>, usize) {
+        let mut saved = 0;
+        if upstream.server.compact_results {
+            let before = crate::results::size(result);
+            crate::results::compact(result);
+            saved = before.saturating_sub(crate::results::size(result));
+        }
+        let Some(max) = upstream.server.max_result else {
+            return (None, saved);
+        };
+        let name = format!("{}-{tool}", upstream.name());
+        let name = name.replace(|c: char| !c.is_ascii_alphanumeric() && c != '-', "_");
+        let cut = crate::results::cap(result, max, &self.results, &name);
+        (cut, saved)
     }
 
     pub fn upstreams(&self) -> &[Arc<Upstream>] {
@@ -407,6 +441,7 @@ impl ServerHandler for Hub {
             ));
         };
         let (client, started) = (Client::of(&context), Instant::now());
+        let (mut cut, mut compacted) = (None, 0);
         let (outcome, error, response) = if client.skips(upstream) {
             let var = upstream.server.skip_when_env.as_deref();
             let why = var
@@ -421,8 +456,13 @@ impl ServerHandler for Hub {
         } else {
             request.name = tool.clone().into();
             match upstream.call_tool(request, context.ct).await {
-                Ok(CallToolResponse::Complete(result)) if result.is_error == Some(true) => {
-                    ("tool_error", None, Ok(CallToolResponse::Complete(result)))
+                Ok(CallToolResponse::Complete(mut result)) => {
+                    (cut, compacted) = self.shrink(upstream, &tool, &mut result);
+                    let outcome = match result.is_error {
+                        Some(true) => "tool_error",
+                        _ => "ok",
+                    };
+                    (outcome, None, Ok(CallToolResponse::Complete(result)))
                 }
                 Ok(response) => ("ok", None, Ok(response)),
                 // Its message may repeat what was asked: only the code is recorded.
@@ -449,6 +489,8 @@ impl ServerHandler for Hub {
                 "error": error.map(|e| e.chars().take(160).collect::<String>()),
                 "text": text,
                 "structured": structured,
+                "cut": cut,
+                "compacted": (compacted > 0).then_some(compacted),
             }),
         );
         response

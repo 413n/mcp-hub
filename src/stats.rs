@@ -142,8 +142,10 @@ struct Calls {
     chars: Vec<u64>,
     /// Calls that ended in an error, of the tool or on the way to it.
     failed: u64,
-    /// Results the hub cut short.
+    /// Results the hub kept in a file instead of passing them on whole.
     cut: u64,
+    /// Characters saved by dropping empty fields.
+    compacted: u64,
 }
 
 impl Calls {
@@ -152,6 +154,7 @@ impl Calls {
         self.chars.push(event["text"].as_u64().unwrap_or(0));
         self.failed += u64::from(event["outcome"] != "ok");
         self.cut += u64::from(event["cut"].as_u64().is_some());
+        self.compacted += event["compacted"].as_u64().unwrap_or(0);
     }
 
     fn summary(&mut self) -> Value {
@@ -167,6 +170,7 @@ impl Calls {
             "largestChars": self.chars.last(),
             "totalChars": self.chars.iter().sum::<u64>(),
             "cut": self.cut,
+            "compacted": self.compacted,
         })
     }
 }
@@ -230,6 +234,7 @@ pub fn summary(dir: &Path, days: u64, tools: Option<&[Value]>) -> Value {
         total.chars.extend(&calls.chars);
         total.failed += calls.failed;
         total.cut += calls.cut;
+        total.compacted += calls.compacted;
     }
     let mut called: Vec<_> = by_tool.iter_mut().map(|(k, v)| (k, v.summary())).collect();
     called.sort_by_key(|(_, s)| std::cmp::Reverse(s["totalChars"].as_u64()));
@@ -322,6 +327,15 @@ pub fn render(s: &Value, all: bool) -> String {
         short(&total["totalChars"]),
         short(&json!(total["totalChars"].as_u64().unwrap_or(0) / 4)),
     );
+
+    if n(&total["cut"]) > 0 || n(&total["compacted"]) > 0 {
+        let _ = writeln!(
+            out,
+            "{} results kept in a file for being too large; {} characters saved by dropping empty fields",
+            n(&total["cut"]),
+            short(&total["compacted"]),
+        );
+    }
 
     let tools = list(&s["tools"]);
     if !tools.is_empty() {

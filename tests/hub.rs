@@ -84,6 +84,16 @@ impl ServerHandler for Fake {
         if req.name == "fail" {
             return Err(ErrorData::invalid_params("upstream says no", None));
         }
+        if req.name == "rows" {
+            // A large JSON result with empty fields, as text and as structured content.
+            let rows: Vec<_> = (0..300)
+                .map(|n| json!({"n": n, "note": null, "tags": [], "label": "row"}))
+                .collect();
+            let data = json!({"rows": rows, "next": null});
+            let mut result = CallToolResult::success(vec![ContentBlock::text(data.to_string())]);
+            result.structured_content = Some(data);
+            return Ok(CallToolResponse::Complete(result));
+        }
         let args = serde_json::to_string(&req.arguments).unwrap();
         let text = format!("{}:{args}", req.name);
         Ok(CallToolResponse::Complete(CallToolResult::success(vec![
@@ -600,4 +610,87 @@ async fn cuts_long_descriptions() {
     assert!(describe("whole__wordy").await.contains("Nothing was cut"));
     assert!(describe("nope").await.contains("No tool named"));
     client.cancel().await.unwrap();
+}
+
+/// Results larger than `maxResult` are kept in a file; `compactResults` drops empty fields.
+#[tokio::test]
+async fn shrinks_results() {
+    let fake = format!("http://127.0.0.1:{}/mcp", start_fake(Fake::default()).await);
+    let config = parse_config(
+        &json!({"servers": {
+            "big": {"url": fake, "maxResult": 5000},
+            "lean": {"url": fake, "compactResults": true},
+            "raw": {"url": fake, "maxResult": 0},
+        }})
+        .to_string(),
+    )
+    .unwrap();
+    let dir = std::env::temp_dir().join(format!("mcp-hub-kept-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    let store = SecretStore::memory();
+    let upstreams = config
+        .servers
+        .iter()
+        .map(|s| Upstream::new(s.clone(), store.clone()));
+    let hub = Hub::new(upstreams.collect()).keeping_results_in(dir.clone());
+    let listener = http::bind(0).await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    tokio::spawn(async move { http::serve(listener, hub, TOKEN, CancellationToken::new()).await });
+    let transport = StreamableHttpClientTransport::from_config(
+        StreamableHttpClientTransportConfig::with_uri(format!("http://127.0.0.1:{port}/mcp"))
+            .auth_header(TOKEN),
+    );
+    let client = mcp_hub::upstream::client_info()
+        .serve(transport)
+        .await
+        .unwrap();
+    let call = |name: &'static str| client.call_tool(CallToolRequestParams::new(name));
+
+    let raw = call("raw__rows").await.unwrap();
+    let whole = raw.content[0].as_text().unwrap().text.clone();
+    assert!(
+        whole.len() > 10_000 && raw.structured_content.is_some(),
+        "{}",
+        whole.len()
+    );
+
+    let big = call("big__rows").await.unwrap();
+    let note = &big.content[0].as_text().unwrap().text;
+    assert!(
+        note.len() < 3000 && big.structured_content.is_none(),
+        "{note}"
+    );
+    assert!(
+        note.contains(&format!("this result is {} characters", whole.len())),
+        "{note}"
+    );
+    let path = note
+        .split("in the file ")
+        .nth(1)
+        .unwrap()
+        .split(", kept")
+        .next()
+        .unwrap();
+    assert!(
+        path.starts_with(dir.to_str().unwrap()) && path.contains("big-rows"),
+        "{path}"
+    );
+    let kept: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(path).unwrap()).unwrap();
+    assert_eq!(kept, raw.structured_content.unwrap());
+
+    let lean = call("lean__rows").await.unwrap();
+    let text = &lean.content[0].as_text().unwrap().text;
+    assert!(
+        text.starts_with(r#"{"rows":[{"n":0,"label":"row"}"#),
+        "{}",
+        &text[..80]
+    );
+    assert!(!text.contains("null") && !text.contains("[]"));
+    assert_eq!(
+        lean.structured_content.unwrap()["rows"][1],
+        json!({"n": 1, "label": "row"})
+    );
+    client.cancel().await.unwrap();
+    std::fs::remove_dir_all(&dir).unwrap();
 }

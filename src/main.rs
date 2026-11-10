@@ -90,6 +90,7 @@ async fn serve(config: Config, store: SecretStore) -> Result<()> {
         .map(|s| Upstream::with(s.clone(), store.clone(), Timings::default(), stats.clone()))
         .collect();
     let hub = Hub::with_stats(upstreams, stats);
+    mcp_hub::results::sweep(&stats::state_dir().join("results"));
     let names: Vec<_> = hub
         .upstreams()
         .iter()

@@ -184,6 +184,9 @@ stdio server, see [Local (stdio) servers](#local-stdio-servers)).
 - `maxDescription`: optional, in characters, default 2000; `0` for no limit.
   See [Long descriptions](#long-descriptions). Also accepted at the top level of
   the config, next to `port`, as the default for every server.
+- `maxResult`: optional, in characters, default 40000; `0` for no limit.
+  `compactResults`: optional, `true` to drop empty fields from results. See
+  [Large results](#large-results). Both are also accepted at the top level.
 - `skipWhenEnv`: optional, the name of an environment variable. An agent started
   with that variable set does not get this server: it is not in its tool list
   or in the instructions, and a call to it is refused with a note. For a server
@@ -231,6 +234,27 @@ Every tool stays listed under its name, and what a tool does comes first in its
 description, so finding the right tool works as before. `mcp-hub stats` says how
 many tools were cut and what that saves; set `"maxDescription": 0` on a server
 whose tools work worse for it.
+
+### Large results
+
+A tool result goes into the agent's context whole. The hub can trim that:
+
+- **`maxResult`** (default 40000 characters, about 10,000 tokens): a larger
+  result is written to a file, and the agent gets, instead of it, the file's
+  path, the result's size and its first 2000 characters. It reads what it needs
+  from the file (JSON is written indented, so `jq`, `grep` or a range of lines
+  work). The files are in `~/.local/state/mcp-hub/results/`, readable by you
+  alone, and deleted after an hour. Agents have such limits of their own, but
+  higher ones: Claude Code does the same past about 25,000 tokens.
+- **`compactResults`** (off by default): drops fields that say nothing (`null`,
+  `""`, `[]`, `{}`) from JSON results. Some servers return every field of every
+  record, set or not; for those it saves up to a third. A server whose agents
+  need to tell "empty" from "missing" should leave it off.
+
+Both apply to the text of a result and to its structured copy
+(`structuredContent`), which some servers send as well: agents differ in which
+of the two they show their model (Claude Code the structured one, Codex both).
+`mcp-hub stats` counts the results kept in files and what compacting saved.
 
 ### Local (stdio) servers
 
@@ -389,12 +413,14 @@ dropped when full; delete the directory to start over.
 - Config: `~/.config/mcp-hub/config.json` (example: `config.example.json`)
 - Binary: `~/.local/bin/mcp-hub` (installer) or `~/.cargo/bin/mcp-hub` (from source)
 - Record for `mcp-hub stats`: `~/.local/state/mcp-hub/events.jsonl`
+- Results too large to pass on whole: `~/.local/state/mcp-hub/results/` (kept an hour)
 - Service, Linux: `~/.config/systemd/user/mcp-hub.service`, generated from `systemd/`
 - Service, macOS: `~/Library/LaunchAgents/dev.mcp-hub.plist`, generated from `launchd/`
 - Code: `src/http.rs` (inbound checks), `src/hub.rs` (tool merging and routing),
   `src/connect.rs` (what agents run to reach the hub),
   `src/upstream.rs` (HTTP and stdio upstreams), `src/oauth.rs`, `src/login.rs`,
-  `src/secrets.rs` (keyring), `src/stats.rs` (the record and `mcp-hub stats`)
+  `src/secrets.rs` (keyring), `src/stats.rs` (the record and `mcp-hub stats`),
+  `src/results.rs` (`maxResult`, `compactResults`)
 
 ## Security model
 
@@ -410,6 +436,8 @@ dropped when full; delete the directory to start over.
 - The record for `mcp-hub stats` says which tools were called, when and by which
   agent, not with what or what came back; it stays on this machine, in a
   directory only you can read.
+- A result larger than `maxResult` is written to a file in that same directory
+  for the agent to read, and deleted after an hour.
 - The hub token only grants access to this localhost endpoint. Agents set up
   with `mcp-hub connect` or `mcp-hub headers` get it from the keyring each time,
   so it is in none of their config files, where a search or a pasted config
