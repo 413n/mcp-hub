@@ -271,6 +271,11 @@ changes and `token --rotate` need one.
 - **Local server works in a terminal but not in the hub (Linux)**: the systemd
   unit restricts sockets to IPv4, IPv6 and Unix ones (`RestrictAddressFamilies`),
   and the server inherits that.
+- **Error ends with "next attempt in 40s"**: that server failed (unreachable,
+  rate limited, did not start) and the hub leaves it alone for a while instead
+  of trying on every request: 5 seconds after the first failure, doubling with
+  each further one up to 5 minutes. Restart the hub to try at once. A missing or
+  expired login is never delayed this way.
 - **Log says it is waiting for the keyring**: unlock the keyring (log in to the
   desktop session); the hub retries every 10 seconds.
 - **Port in use**: change `port` (and the URL in every agent) or `loginPort` in

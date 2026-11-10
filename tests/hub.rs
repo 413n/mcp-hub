@@ -261,6 +261,7 @@ async fn caches_tool_lists() {
     let timings = Timings {
         list_ttl: Duration::from_millis(1500),
         cold_list_wait: Duration::from_millis(300),
+        ..Timings::default()
     };
     let store = SecretStore::memory();
     let hub = Hub::new(

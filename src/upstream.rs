@@ -37,6 +37,8 @@ const LIST_TIMEOUT: Duration = Duration::from_secs(60);
 const CALL_TIMEOUT: Duration = Duration::from_secs(300);
 /// How many of a command server's last stderr lines to keep for a failed connect's error.
 const STDERR_TAIL: usize = 20;
+/// The longest an upstream that keeps failing is left alone between attempts.
+const MAX_RETRY_DELAY: Duration = Duration::from_secs(300);
 
 type Client = RunningService<RoleClient, ClientConfig>;
 
@@ -66,6 +68,9 @@ pub struct Timings {
     pub list_ttl: Duration,
     /// How long a tools/list waits for an upstream whose tools are not cached yet.
     pub cold_list_wait: Duration,
+    /// How long an upstream is left alone after it failed once; doubles with every failure in
+    /// a row, up to 5 minutes.
+    pub retry_delay: Duration,
 }
 
 impl Default for Timings {
@@ -73,6 +78,7 @@ impl Default for Timings {
         Self {
             list_ttl: Duration::from_secs(300),
             cold_list_wait: Duration::from_secs(5),
+            retry_delay: Duration::from_secs(5),
         }
     }
 }
@@ -83,6 +89,14 @@ struct CachedTools {
     fetched: Instant,
 }
 
+/// An upstream that failed, and until when it is not tried again.
+struct Failing {
+    /// Failures in a row.
+    count: u32,
+    until: Instant,
+    error: String,
+}
+
 pub struct Upstream {
     pub server: ServerConfig,
     store: SecretStore,
@@ -91,6 +105,7 @@ pub struct Upstream {
     me: Weak<Upstream>,
     client: Mutex<Option<Arc<Client>>>,
     cache: std::sync::Mutex<Option<CachedTools>>,
+    failing: std::sync::Mutex<Option<Failing>>,
     /// Set while a background refresh of `cache` runs, so that there is only one.
     refreshing: AtomicBool,
     /// Bumped when a background refresh ends, whatever its outcome.
@@ -120,6 +135,7 @@ impl Upstream {
             me: me.clone(),
             client: Mutex::new(None),
             cache: std::sync::Mutex::new(None),
+            failing: std::sync::Mutex::new(None),
             refreshing: AtomicBool::new(false),
             refreshed: watch::channel(0).0,
         })
@@ -251,19 +267,31 @@ impl Upstream {
         })
     }
 
-    async fn client(&self) -> Result<Arc<Client>, UpstreamError> {
+    /// The connection, made now if there is none, and whether it was.
+    async fn client(&self) -> Result<(Arc<Client>, bool), UpstreamError> {
         let mut slot = self.client.lock().await;
         if let Some(client) = slot.as_ref()
             && !client.is_closed()
         {
-            return Ok(client.clone());
+            return Ok((client.clone(), false));
         }
-        let client = tokio::time::timeout(CONNECT_TIMEOUT, self.connect())
+        if let Some(e) = self.failing() {
+            return Err(e);
+        }
+        let connected = tokio::time::timeout(CONNECT_TIMEOUT, self.connect())
             .await
-            .map_err(|_| UpstreamError::Other("connection timed out".into()))??;
-        let client = Arc::new(client);
-        *slot = Some(client.clone());
-        Ok(client)
+            .unwrap_or_else(|_| Err(UpstreamError::Other("connection timed out".into())));
+        match connected {
+            Ok(client) => {
+                let client = Arc::new(client);
+                *slot = Some(client.clone());
+                Ok((client, true))
+            }
+            Err(e) => {
+                self.failed(&e);
+                Err(e)
+            }
+        }
     }
 
     /// Drop the connection so the next request reconnects.
@@ -278,32 +306,69 @@ impl Upstream {
         }
     }
 
+    /// Note a failure: the upstream is not tried again for a while, longer each time in a
+    /// row, so that agents asking for it do not turn one failure into a stream of attempts.
+    fn failed(&self, error: &UpstreamError) {
+        // A missing or expired login is fixed by a command, which must work at once.
+        if matches!(error, UpstreamError::NeedsLogin(_)) {
+            return;
+        }
+        let mut failing = self.failing.lock().unwrap();
+        let count = failing.as_ref().map_or(0, |f| f.count) + 1;
+        let delay = self.timings.retry_delay * 2u32.saturating_pow(count - 1);
+        *failing = Some(Failing {
+            count,
+            until: Instant::now() + delay.min(MAX_RETRY_DELAY),
+            error: error.to_string(),
+        });
+    }
+
+    fn succeeded(&self) {
+        self.failing.lock().unwrap().take();
+    }
+
+    /// The last failure, while the upstream is being left alone because of it.
+    fn failing(&self) -> Option<UpstreamError> {
+        let failing = self.failing.lock().unwrap();
+        let f = failing.as_ref()?;
+        let left = f.until.checked_duration_since(Instant::now())?;
+        Some(UpstreamError::Other(format!(
+            "{}; next attempt in {}s",
+            f.error,
+            left.as_secs_f32().ceil()
+        )))
+    }
+
     /// Ask the upstream for its tools, under their own names. Also updates the cached list.
     pub async fn list_tools(&self) -> Result<Vec<Tool>, UpstreamError> {
-        // Listing is idempotent, so retry once on a fresh connection.
         for attempt in 0..2 {
-            let client = self.client().await?;
-            let result = tokio::time::timeout(LIST_TIMEOUT, client.list_all_tools()).await;
-            match result {
+            let (client, fresh) = self.client().await?;
+            let error = match tokio::time::timeout(LIST_TIMEOUT, client.list_all_tools()).await {
                 Ok(Ok(tools)) => {
+                    self.succeeded();
                     *self.cache.lock().unwrap() = Some(CachedTools {
                         tools: Arc::new(hub_tools(self.name(), &tools)),
                         fetched: Instant::now(),
                     });
                     return Ok(tools);
                 }
-                Ok(Err(ServiceError::McpError(e))) => return Err(UpstreamError::Mcp(e)),
+                Ok(Err(ServiceError::McpError(e))) => UpstreamError::Mcp(e),
                 Ok(Err(e)) => {
                     self.reset().await;
-                    if attempt == 1 {
-                        return Err(self.convert(e));
+                    // An old connection may just have gone stale (session expired, server
+                    // restarted): listing is idempotent, so try once more on a new one.
+                    if !fresh && attempt == 0 {
+                        continue;
                     }
+                    self.convert(e)
                 }
                 Err(_) => {
                     self.reset().await;
-                    return Err(UpstreamError::Other("tools/list timed out".into()));
+                    UpstreamError::Other("tools/list timed out".into())
                 }
-            }
+            };
+            self.failed(&error);
+            return Err(error);
         }
         unreachable!()
     }
@@ -326,16 +391,20 @@ impl Upstream {
             }
             return Some(tools);
         }
+        if self.failing().is_some() {
+            return None;
+        }
         let mut done = self.refreshed.subscribe();
         self.refresh();
         let _ = tokio::time::timeout(self.timings.cold_list_wait, done.changed()).await;
         cached(&self.cache.lock().unwrap()).map(|(tools, _)| tools)
     }
 
-    /// Fetch the tool list in the background, unless that is already happening.
+    /// Fetch the tool list in the background, unless that is already happening or the
+    /// upstream just failed.
     fn refresh(&self) {
         let Some(me) = self.me.upgrade() else { return };
-        if self.refreshing.swap(true, Ordering::AcqRel) {
+        if self.failing().is_some() || self.refreshing.swap(true, Ordering::AcqRel) {
             return;
         }
         tokio::spawn(async move {
@@ -352,11 +421,14 @@ impl Upstream {
         params: CallToolRequestParams,
         cancel: CancellationToken,
     ) -> Result<CallToolResponse, UpstreamError> {
-        let client = self.client().await?;
+        let (client, _) = self.client().await?;
         let call = tokio::time::timeout(CALL_TIMEOUT, client.peer().call_tool_once(params));
         tokio::select! {
             result = call => match result {
-                Ok(Ok(response)) => Ok(response),
+                Ok(Ok(response)) => {
+                    self.succeeded();
+                    Ok(response)
+                }
                 Ok(Err(e)) => {
                     if !matches!(e, ServiceError::McpError(_)) {
                         self.reset().await;
