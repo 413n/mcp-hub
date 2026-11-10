@@ -8,6 +8,14 @@ Requires=dbus.socket
 ExecStart=@BIN@ serve
 Restart=on-failure
 RestartSec=5
+# A ceiling for the hub and the local servers it starts together, against one that leaks.
+# Above MemoryHigh they are slowed down and swapped out; at MemoryMax the kernel kills the
+# largest process, and OOMPolicy=continue keeps the hub and the other servers running (the
+# hub starts the killed server again on its next call). For one server: "maxMemoryMb".
+MemoryHigh=2G
+MemoryMax=3G
+MemorySwapMax=1G
+OOMPolicy=continue
 NoNewPrivileges=yes
 RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
 LockPersonality=yes

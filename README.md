@@ -232,6 +232,12 @@ How it runs:
 - A tool call may take 5 minutes. When one runs out of time the hub pings the
   server, and if it does not answer within 5 seconds stops it, so that the next
   call gets a new process instead of one that is stuck.
+- On Linux the systemd unit caps the memory of the hub and all its local
+  servers together (`MemoryHigh=2G`, `MemoryMax=3G`): past the first they are
+  slowed down, at the second the kernel kills the largest process, normally the
+  server that leaks, and the hub starts it again on its next call. To change the
+  numbers: `systemctl --user edit mcp-hub`, then for example
+  `[Service]` / `MemoryMax=6G`.
 - It runs in `cwd` (else the hub's directory), not in the agent's project, and
   agents' MCP roots are not forwarded. Servers meant to work on "the current
   repo" (filesystem, git) are better configured in each agent directly.
