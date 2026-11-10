@@ -64,10 +64,29 @@ the command that starts it. Check at any time with:
 
 **macOS:** the first time `mcp-hub` reads the Keychain, macOS asks for your
 password to let it: choose *Always Allow*. Each update or rebuild is a new
-binary to macOS, so it asks again once after every `install-service.sh`. Once:
-all of mcp-hub's secrets are in a single Keychain item. (Versions up to 0.4 kept
+binary to macOS, so it asks again once after every `install-service.sh`, unless
+you sign it (below). Once: all of mcp-hub's secrets are in a single Keychain item. (Versions up to 0.4 kept
 one item per secret. The first time 0.5 or later needs one of those, macOS asks
 for it one last time while it moves into the single item.)
+
+### Signing on macOS (optional)
+
+Release binaries are not signed by a paid Apple developer account. To macOS each
+new version is then a different program, so the Keychain asks again after every
+update. It stops asking once you sign them with a certificate of your own, made
+once on your Mac (nothing to pay, and it never leaves the Mac):
+
+1. Open *Keychain Access*, then in the menu *Keychain Access → Certificate
+   Assistant → Create a Certificate…*
+2. Name: `mcp-hub`, Identity Type: *Self Signed Root*, Certificate Type: *Code
+   Signing*. Create.
+3. Install again, which now signs the binary: `mcp-hub update <the version you
+   have>` (see `mcp-hub --version`), or `bin/install-service.sh` from a clone.
+   macOS asks whether `codesign` may use the new key, then the Keychain asks
+   about mcp-hub once more: *Always Allow* both.
+
+From then on the installer signs each update with it, and macOS asks no more.
+(To use a certificate with another name: `MCP_HUB_SIGN=<name>`.)
 
 ## 2. Connect your agents
 
@@ -397,7 +416,7 @@ Update: `mcp-hub update` for one-line installs (it runs that release's
 `install.sh`: checksum check, binary swap, service restart; config, logins and
 token stay). For a clone: `git pull && bin/install-service.sh`. On macOS the
 Keychain asks once more after an update, during the install: choose *Always
-Allow*.
+Allow* (or sign it, see [Signing on macOS](#signing-on-macos-optional)).
 
 `mcp-hub status` asks the running hub, which has the servers' logins at hand
 and checks them all at once; only when no hub runs does it connect to each
