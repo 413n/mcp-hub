@@ -6,7 +6,7 @@
 use std::collections::VecDeque;
 use std::process::Stdio;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Weak};
+use std::sync::{Arc, LazyLock, Weak};
 use std::time::{Duration, Instant};
 
 use rmcp::{
@@ -52,6 +52,45 @@ pub enum UpstreamError {
     Mcp(rmcp::ErrorData),
     #[error("{0}")]
     Other(String),
+}
+
+/// The HTTP client for an upstream at `url`. There are two, shared by all upstreams.
+///
+/// Remote (https) servers get one that keeps connections open and speaks HTTP/2: requests to
+/// a server then share a connection instead of each doing a TLS handshake. Local (http)
+/// servers get one that does not keep connections, as in rmcp's own default: a new loopback
+/// connection costs nothing, and reusing one can stall a request for 40 ms (delayed ACK).
+fn http_client(url: &str) -> reqwest::Client {
+    fn build(keep_connections: bool) -> reqwest::Client {
+        // As rmcp's default client: only follow redirects that keep the request as it is
+        // (307, 308) and stay on the same origin, so credentials never go elsewhere.
+        let redirects = reqwest::redirect::Policy::custom(|attempt| {
+            let keeps_request = matches!(attempt.status().as_u16(), 307 | 308);
+            let same_origin = attempt
+                .previous()
+                .first()
+                .is_some_and(|first| first.origin() == attempt.url().origin());
+            if !keeps_request || !same_origin {
+                attempt.stop()
+            } else if attempt.previous().len() > 10 {
+                attempt.error("too many redirects")
+            } else {
+                attempt.follow()
+            }
+        });
+        let mut builder = reqwest::Client::builder().redirect(redirects);
+        if !keep_connections {
+            builder = builder.pool_max_idle_per_host(0);
+        }
+        builder.build().expect("HTTP client")
+    }
+    static REMOTE: LazyLock<reqwest::Client> = LazyLock::new(|| build(true));
+    static LOCAL: LazyLock<reqwest::Client> = LazyLock::new(|| build(false));
+    if url.starts_with("https:") {
+        REMOTE.clone()
+    } else {
+        LOCAL.clone()
+    }
 }
 
 pub fn client_info() -> ClientConfig {
@@ -218,9 +257,9 @@ impl Upstream {
         let config = StreamableHttpClientTransportConfig::with_uri(url);
         let serving = match &self.server.auth {
             Auth::None => {
-                client_info()
-                    .serve(StreamableHttpClientTransport::from_config(config))
-                    .await
+                let transport =
+                    StreamableHttpClientTransport::with_client(http_client(url), config);
+                client_info().serve(transport).await
             }
             Auth::Bearer => {
                 let token = self
@@ -233,8 +272,10 @@ impl Upstream {
                         "no token stored, run \"mcp-hub set-token {name}\""
                     )));
                 };
-                let transport =
-                    StreamableHttpClientTransport::from_config(config.auth_header(token));
+                let transport = StreamableHttpClientTransport::with_client(
+                    http_client(url),
+                    config.auth_header(token),
+                );
                 client_info().serve(transport).await
             }
             Auth::OAuth { .. } => {
@@ -252,7 +293,7 @@ impl Upstream {
                         "not logged in, run \"mcp-hub login {name}\""
                     )));
                 }
-                let http = AuthClient::new(reqwest::Client::default(), manager);
+                let http = AuthClient::new(http_client(url), manager);
                 client_info()
                     .serve(StreamableHttpClientTransport::with_client(http, config))
                     .await
