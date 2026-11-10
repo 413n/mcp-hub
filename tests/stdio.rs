@@ -338,3 +338,43 @@ async fn stopping_a_server_stops_what_it_started() {
     local.close().await;
     assert!(!children.running());
 }
+
+#[tokio::test]
+async fn stops_a_server_that_uses_too_much_memory() {
+    let log = StartLog::new("large");
+    let children = StartLog::new("large-children");
+    let local = upstream_with(
+        json!({
+            "command": "/bin/sh",
+            "args": [fixtures().join("stdio-server.sh")],
+            "env": {"START_LOG": log.0, "CHILD_LOG": children.0},
+            "maxMemoryMb": 20,
+        }),
+        &SecretStore::memory(),
+        Timings {
+            memory_check: Duration::from_millis(200),
+            ..Timings::default()
+        },
+    );
+
+    // Measured a few times and found small: it stays.
+    assert!(call_text(&local, "env").await.is_ok());
+    tokio::time::sleep(Duration::from_millis(900)).await;
+    assert!(log.running());
+
+    // What it starts counts too: with a child holding 30 MB it is stopped, child included.
+    assert_eq!(call_text(&local, "hog").await.unwrap(), "hogging");
+    for _ in 0..100 {
+        if !log.running() && !children.running() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert!(!log.running());
+    assert!(!children.running());
+
+    // The next call starts it again.
+    assert!(call_text(&local, "env").await.is_ok());
+    assert_eq!(log.starts(), 2);
+    local.close().await;
+}

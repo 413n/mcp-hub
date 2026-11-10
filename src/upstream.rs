@@ -176,6 +176,8 @@ pub struct Timings {
     pub call_timeout: Duration,
     /// How long a server has to answer a ping after one of its calls timed out.
     pub ping_timeout: Duration,
+    /// How often the memory of a command server with `maxMemoryMb` is measured.
+    pub memory_check: Duration,
 }
 
 impl Default for Timings {
@@ -186,6 +188,7 @@ impl Default for Timings {
             retry_delay: Duration::from_secs(5),
             call_timeout: Duration::from_secs(300),
             ping_timeout: Duration::from_secs(5),
+            memory_check: Duration::from_secs(15),
         }
     }
 }
@@ -446,6 +449,11 @@ impl Upstream {
                 *self.last_used.lock().unwrap() = Instant::now();
                 if let Some(idle) = self.server.idle_timeout {
                     tokio::spawn(close_when_idle(self.me.clone(), id, idle));
+                }
+                if let Endpoint::Stdio(stdio) = &self.server.endpoint
+                    && let (Some(pid), Some(limit)) = (pid, stdio.max_memory_mb)
+                {
+                    tokio::spawn(stop_when_too_large(self.me.clone(), id, pid, limit));
                 }
                 Ok(lease(conn, true))
             }
@@ -711,6 +719,70 @@ async fn close_when_idle(upstream: Weak<Upstream>, id: u64, idle: Duration) {
             return;
         }
     }
+}
+
+/// Stop a command server (connection `id`, process group `pid`) once it uses more than
+/// `limit_mb` of memory. Ends when that connection is gone, whoever closed it.
+async fn stop_when_too_large(upstream: Weak<Upstream>, id: u64, pid: u32, limit_mb: u64) {
+    let mut was_over = false;
+    loop {
+        let Some(every) = upstream.upgrade().map(|u| u.timings.memory_check) else {
+            return;
+        };
+        tokio::time::sleep(every).await;
+        let Some(upstream) = upstream.upgrade() else {
+            return;
+        };
+        let current = (upstream.conn.lock().await.as_ref())
+            .is_some_and(|conn| conn.id == id && !conn.service.is_closed());
+        if !current {
+            return;
+        }
+        let measured = tokio::time::timeout(Duration::from_secs(10), group_memory_mb(pid)).await;
+        let used = match measured {
+            Ok(Ok(mb)) => mb,
+            Ok(Err(e)) => {
+                tracing::warn!(
+                    "[{}] maxMemoryMb is not enforced: cannot run ps: {e}",
+                    upstream.name()
+                );
+                return;
+            }
+            Err(_) => continue,
+        };
+        // Twice in a row, so that a short peak is let through.
+        if used > limit_mb && was_over {
+            tracing::warn!(
+                "[{}] stopped: it uses {used} MB, more than its maxMemoryMb of {limit_mb}",
+                upstream.name()
+            );
+            upstream.reset(id).await;
+            return;
+        }
+        was_over = used > limit_mb;
+    }
+}
+
+/// Resident memory, in MB, of all the processes in process group `pgid`. Asked of `ps`,
+/// which answers the same way on Linux and macOS.
+async fn group_memory_mb(pgid: u32) -> std::io::Result<u64> {
+    let output = tokio::process::Command::new("ps")
+        .args(["-A", "-o", "pgid=", "-o", "rss="])
+        .stdin(Stdio::null())
+        .stderr(Stdio::null())
+        .kill_on_drop(true)
+        .output()
+        .await?;
+    let kb: u64 = String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .filter_map(|line| {
+            let mut fields = line.split_whitespace();
+            let group: u32 = fields.next()?.parse().ok()?;
+            let rss: u64 = fields.next()?.parse().ok()?;
+            (group == pgid).then_some(rss)
+        })
+        .sum();
+    Ok(kb / 1024)
 }
 
 /// The line that most likely says why a process died: the last one mentioning an error

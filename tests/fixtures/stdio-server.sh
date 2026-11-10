@@ -38,6 +38,7 @@ while IFS= read -r line; do
         (
             x=$(head -c 30000000 /dev/zero | tr '\0' a)
             sleep 60
+            : # not the last command, or the shell holding $x is replaced by sleep
         ) >/dev/null 2>&1 &
         echo $! >> "$CHILD_LOG"
         printf '{"jsonrpc":"2.0","id":%s,"result":{"content":[{"type":"text","text":"hogging"}]}}\n' "$id"

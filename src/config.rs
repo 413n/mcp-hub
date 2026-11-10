@@ -50,6 +50,8 @@ pub struct StdioCommand {
     pub cwd: Option<PathBuf>,
     /// Environment variables whose values live in the keyring (`mcp-hub set-token <server> <VAR>`).
     pub secret_env: Vec<String>,
+    /// Stop the server when it and the processes it started use more memory than this.
+    pub max_memory_mb: Option<u64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -111,6 +113,7 @@ struct RawServer {
     env: Option<BTreeMap<String, String>>,
     cwd: Option<String>,
     secret_env: Option<Vec<String>>,
+    max_memory_mb: Option<u64>,
     /// Seconds; 0 for never.
     idle_timeout: Option<u64>,
     description: Option<String>,
@@ -187,12 +190,18 @@ fn parse_stdio(at: &str, s: RawServer, command: String) -> Result<StdioCommand> 
             bail!("{at}: \"{name}\" is in both env and secretEnv");
         }
     }
+    if s.max_memory_mb == Some(0) {
+        bail!(
+            "{at}.maxMemoryMb: expected a number of megabytes above 0 (leave it out for no limit)"
+        );
+    }
     Ok(StdioCommand {
         command,
         args: s.args.unwrap_or_default(),
         env,
         cwd,
         secret_env,
+        max_memory_mb: s.max_memory_mb,
     })
 }
 
@@ -239,9 +248,15 @@ pub fn parse_config(text: &str) -> Result<Config> {
             }
             (None, Some(command)) => (Endpoint::Stdio(parse_stdio(&at, s, command)?), Auth::None),
             (Some(url), None) => {
-                if s.args.is_some() || s.env.is_some() || s.cwd.is_some() || s.secret_env.is_some()
+                if s.args.is_some()
+                    || s.env.is_some()
+                    || s.cwd.is_some()
+                    || s.secret_env.is_some()
+                    || s.max_memory_mb.is_some()
                 {
-                    bail!("{at}: args, env, cwd and secretEnv only apply to command servers");
+                    bail!(
+                        "{at}: args, env, cwd, secretEnv and maxMemoryMb only apply to command servers"
+                    );
                 }
                 let url = Url::parse(&url).with_context(|| format!("{at}.url"))?;
                 if !(url.scheme() == "https" || (url.scheme() == "http" && is_loopback(&url))) {
@@ -307,7 +322,8 @@ mod tests {
         let c = parse_config(
             r#"{"servers":{"p":{
                 "command":"/usr/bin/node","args":["--import","x.mjs","main.ts"],
-                "cwd":"/home/me/p","env":{"MODE":"dev"},"secretEnv":["API_TOKEN"],"description":"d"
+                "cwd":"/home/me/p","env":{"MODE":"dev"},"secretEnv":["API_TOKEN"],"description":"d",
+                "maxMemoryMb":512
             },"q":{"type":"stdio","command":"uvx"},"r":{"type":"http","url":"https://r/"}}}"#,
         )
         .unwrap();
@@ -322,6 +338,7 @@ mod tests {
                 env: [("MODE".to_owned(), "dev".to_owned())].into(),
                 cwd: Some("/home/me/p".into()),
                 secret_env: vec!["API_TOKEN".into()],
+                max_memory_mb: Some(512),
             })
         );
         assert!(
@@ -439,6 +456,14 @@ mod tests {
             (
                 r#"{"servers":{"a":{"type":"sse","url":"https://x/"}}}"#,
                 "type sse",
+            ),
+            (
+                r#"{"servers":{"a":{"url":"https://x/","maxMemoryMb":100}}}"#,
+                "maxMemoryMb on a url server",
+            ),
+            (
+                r#"{"servers":{"a":{"command":"x","maxMemoryMb":0}}}"#,
+                "maxMemoryMb 0",
             ),
             (
                 r#"{"servers":{"a":{"command":"x","idleTimeout":"10m"}}}"#,

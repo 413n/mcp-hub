@@ -211,6 +211,8 @@ an agent works, with a `description` added:
   Store each with `mcp-hub set-token <name> <VAR>` (input hidden).
 - `idleTimeout`: optional, in seconds; how long the server may go without a tool
   call before the hub stops it. 600 (10 minutes) by default, `0` to never stop it.
+- `maxMemoryMb`: optional; stop the server when it uses more memory than this,
+  e.g. `"maxMemoryMb": 1024`. No limit by default.
 
 **`PATH` is minimal.** The service does not load your shell profile, so it
 typically sees only system directories such as `/usr/bin` and `/bin`: Homebrew,
@@ -238,6 +240,12 @@ How it runs:
   server that leaks, and the hub starts it again on its next call. To change the
   numbers: `systemctl --user edit mcp-hub`, then for example
   `[Service]` / `MemoryMax=6G`.
+- With `maxMemoryMb`, on Linux and macOS, the hub measures every 15 seconds the
+  memory of the server and of everything it started (resident memory, as `ps`
+  reports it) and stops it when that is above the limit twice in a row. A call
+  in progress then fails; the next one starts the server again. This is for a
+  server that grows slowly: one that takes gigabytes within seconds is only
+  stopped in time by the unit's cap.
 - It runs in `cwd` (else the hub's directory), not in the agent's project, and
   agents' MCP roots are not forwarded. Servers meant to work on "the current
   repo" (filesystem, git) are better configured in each agent directly.
