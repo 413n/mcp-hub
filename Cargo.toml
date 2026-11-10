@@ -23,6 +23,7 @@ bytes = "1"
 futures = "0.3"
 getrandom = "0.3"
 http-body-util = "0.1"
+libc = "0.2"
 hyper = { version = "1", features = ["server", "http1"] }
 hyper-util = { version = "0.1", features = ["tokio"] }
 reqwest = { version = "0.13", default-features = false, features = ["http2"] }

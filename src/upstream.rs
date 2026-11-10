@@ -65,6 +65,22 @@ struct Conn {
     /// Tells this connection from the ones before and after it.
     id: u64,
     service: Client,
+    /// A command server's process. It leads its own process group, which holds all it started.
+    pid: Option<u32>,
+}
+
+impl Conn {
+    /// Close the connection. A command server is asked to exit (its stdin is closed, then
+    /// SIGTERM, then SIGKILL, a few seconds apart), and then whatever is left of its process
+    /// group is killed: a server that exits at once may leave behind what it started.
+    async fn close(self) {
+        let _ = self.service.cancel().await;
+        if let Some(pid) = self.pid.filter(|pid| *pid > 1) {
+            // SAFETY: this only sends a signal. The group is the server's own, never the
+            // hub's: the server was started as the leader of a new one.
+            unsafe { libc::killpg(pid as libc::pid_t, libc::SIGKILL) };
+        }
+    }
 }
 
 /// A connection lent to one request. While it exists the upstream counts as busy, so the
@@ -409,8 +425,9 @@ impl Upstream {
         {
             return Ok(lease(conn, false));
         }
-        if slot.take().is_some() {
+        if let Some(conn) = slot.take() {
             tracing::info!("[{}] {} by itself", self.name(), self.gone());
+            tokio::spawn(conn.close());
         }
         if let Some(e) = self.failing() {
             return Err(e);
@@ -425,7 +442,7 @@ impl Upstream {
                     None => tracing::debug!("[{}] connected", self.name()),
                 }
                 let id = self.connections.fetch_add(1, Ordering::Relaxed);
-                let conn = slot.insert(Conn { id, service });
+                let conn = slot.insert(Conn { id, service, pid });
                 *self.last_used.lock().unwrap() = Instant::now();
                 if let Some(idle) = self.server.idle_timeout {
                     tokio::spawn(close_when_idle(self.me.clone(), id, idle));
@@ -439,11 +456,14 @@ impl Upstream {
         }
     }
 
-    /// Drop connection `id`, if it is still the current one, so the next request reconnects.
+    /// Give up connection `id`, if it is still the current one, so the next request
+    /// reconnects. It is closed in the background: that can take a few seconds.
     async fn reset(&self, id: u64) {
         let mut slot = self.conn.lock().await;
-        if slot.as_ref().is_some_and(|conn| conn.id == id) {
-            slot.take();
+        if slot.as_ref().is_some_and(|conn| conn.id == id)
+            && let Some(conn) = slot.take()
+        {
+            tokio::spawn(conn.close());
         }
     }
 
@@ -644,7 +664,7 @@ impl Upstream {
     pub async fn close(&self) {
         let conn = self.conn.lock().await.take();
         if let Some(conn) = conn {
-            let _ = conn.service.cancel().await;
+            conn.close().await;
         }
     }
 }
@@ -675,19 +695,19 @@ async fn close_when_idle(upstream: Weak<Upstream>, id: u64, idle: Duration) {
         let unused = upstream.busy.load(Ordering::Acquire) == 0
             && upstream.last_used.lock().unwrap().elapsed() >= idle;
         if closed || unused {
-            let conn = slot.take();
+            let Some(conn) = slot.take() else { return };
             drop(slot);
-            if let Some(conn) = conn
-                && !closed
-            {
+            if closed {
+                tracing::info!("[{}] {} by itself", upstream.name(), upstream.gone());
+            } else {
                 tracing::info!(
                     "[{}] {}: no tool call for {}s",
                     upstream.name(),
                     upstream.gone(),
                     idle.as_secs()
                 );
-                let _ = conn.service.cancel().await;
             }
+            conn.close().await;
             return;
         }
     }

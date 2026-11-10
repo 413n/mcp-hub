@@ -319,3 +319,22 @@ async fn replaces_a_server_that_stopped_answering() {
     assert!(log.running());
     local.close().await;
 }
+
+#[tokio::test]
+async fn stopping_a_server_stops_what_it_started() {
+    let children = StartLog::new("children");
+    let local = upstream(
+        json!({
+            "command": "/bin/sh",
+            "args": [fixtures().join("stdio-server.sh")],
+            "env": {"CHILD_LOG": children.0},
+        }),
+        &SecretStore::memory(),
+    );
+    assert_eq!(call_text(&local, "hog").await.unwrap(), "hogging");
+    assert!(children.running());
+
+    // The server itself exits as soon as it is asked to, leaving its child behind.
+    local.close().await;
+    assert!(!children.running());
+}
