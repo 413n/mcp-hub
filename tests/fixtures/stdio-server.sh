@@ -1,7 +1,8 @@
 #!/bin/sh
 # A minimal MCP server over stdio, for tests: one JSON-RPC message per line.
 # Tools: "env" answers with its working directory and $FAKE_SECRET, "crash" exits.
-# Not listed: "slow" answers after 2 seconds, "notify" says that the tool list changed.
+# Not listed: "slow" answers after 2 seconds, answering other requests meanwhile, "hang"
+# stops answering anything, "notify" says that the tool list changed.
 # With $START_LOG set, appends its pid to that file. While the file $MORE_FLAG exists, there
 # is one more tool, "more".
 [ -n "$START_LOG" ] && echo $$ >> "$START_LOG"
@@ -27,8 +28,16 @@ while IFS= read -r line; do
         printf '{"jsonrpc":"2.0","id":%s,"result":{"content":[{"type":"text","text":"notified"}]}}\n' "$id"
         ;;
     *'"method":"tools/call"'*'"name":"slow"'*)
-        sleep 2
-        printf '{"jsonrpc":"2.0","id":%s,"result":{"content":[{"type":"text","text":"slow done"}]}}\n' "$id"
+        (
+            sleep 2
+            printf '{"jsonrpc":"2.0","id":%s,"result":{"content":[{"type":"text","text":"slow done"}]}}\n' "$id"
+        ) &
+        ;;
+    *'"method":"tools/call"'*'"name":"hang"'*)
+        sleep 60
+        ;;
+    *'"method":"ping"'*)
+        printf '{"jsonrpc":"2.0","id":%s,"result":{}}\n' "$id"
         ;;
     *'"method":"tools/call"'*)
         printf '{"jsonrpc":"2.0","id":%s,"result":{"content":[{"type":"text","text":"cwd=%s secret=%s"}]}}\n' "$id" "$(pwd -P)" "$FAKE_SECRET"

@@ -54,9 +54,13 @@ impl StartLog {
 
     /// Whether the process that started last is still there.
     fn running(&self) -> bool {
-        let pid = self.lines().pop().expect("a started process");
+        self.nth_running(self.starts() - 1)
+    }
+
+    /// Whether the `n`th process that started (from 0) is still there.
+    fn nth_running(&self, n: usize) -> bool {
         std::process::Command::new("kill")
-            .args(["-0", &pid])
+            .args(["-0", &self.lines()[n]])
             .stderr(std::process::Stdio::null())
             .status()
             .unwrap()
@@ -270,5 +274,48 @@ async fn follows_a_changing_tool_list() {
     assert!(call_text(&local, "crash").await.is_err());
     assert!(call_text(&local, "env").await.is_ok());
     assert!(cached_tools(&local, 2).await);
+    local.close().await;
+}
+
+#[tokio::test]
+async fn replaces_a_server_that_stopped_answering() {
+    let log = StartLog::new("hung");
+    let local = upstream_with(
+        json!({
+            "command": "/bin/sh",
+            "args": [fixtures().join("stdio-server.sh")],
+            "env": {"START_LOG": log.0},
+        }),
+        &SecretStore::memory(),
+        Timings {
+            call_timeout: Duration::from_millis(300),
+            ping_timeout: Duration::from_millis(700),
+            ..Timings::default()
+        },
+    );
+
+    // A call that takes too long fails, but the server still answers: it stays.
+    let err = call_text(&local, "slow").await.unwrap_err().to_string();
+    assert!(err.contains("timed out"), "{err}");
+    tokio::time::sleep(Duration::from_millis(1000)).await;
+    assert!(log.running());
+    assert!(call_text(&local, "env").await.is_ok());
+    assert_eq!(log.starts(), 1);
+
+    // One that answers nothing any more is given up: the next call gets a new process...
+    let err = call_text(&local, "hang").await.unwrap_err().to_string();
+    assert!(err.contains("timed out"), "{err}");
+    tokio::time::sleep(Duration::from_millis(1200)).await;
+    assert!(call_text(&local, "env").await.is_ok());
+    assert_eq!(log.starts(), 2);
+    // ...and the old one is killed, after the few seconds it gets to exit by itself.
+    for _ in 0..100 {
+        if !log.nth_running(0) {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert!(!log.nth_running(0));
+    assert!(log.running());
     local.close().await;
 }

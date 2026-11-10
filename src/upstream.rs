@@ -12,8 +12,8 @@ use std::time::{Duration, Instant};
 use rmcp::{
     ClientHandler, Peer, RoleClient, ServiceError, ServiceExt,
     model::{
-        CallToolRequestParams, CallToolResponse, ClientCapabilities, ClientConfig, Implementation,
-        Tool,
+        CallToolRequestParams, CallToolResponse, ClientCapabilities, ClientConfig, ClientRequest,
+        Implementation, Tool,
     },
     service::{NotificationContext, RunningService},
     transport::{
@@ -34,7 +34,6 @@ use crate::secrets::SecretStore;
 
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
 const LIST_TIMEOUT: Duration = Duration::from_secs(60);
-const CALL_TIMEOUT: Duration = Duration::from_secs(300);
 /// How many of a command server's last stderr lines to keep for a failed connect's error.
 const STDERR_TAIL: usize = 20;
 /// The longest an upstream that keeps failing is left alone between attempts.
@@ -157,6 +156,10 @@ pub struct Timings {
     /// How long an upstream is left alone after it failed once; doubles with every failure in
     /// a row, up to 5 minutes.
     pub retry_delay: Duration,
+    /// How long a tool call may take.
+    pub call_timeout: Duration,
+    /// How long a server has to answer a ping after one of its calls timed out.
+    pub ping_timeout: Duration,
 }
 
 impl Default for Timings {
@@ -165,6 +168,8 @@ impl Default for Timings {
             list_ttl: Duration::from_secs(300),
             cold_list_wait: Duration::from_secs(5),
             retry_delay: Duration::from_secs(5),
+            call_timeout: Duration::from_secs(300),
+            ping_timeout: Duration::from_secs(5),
         }
     }
 }
@@ -573,7 +578,8 @@ impl Upstream {
             // The server just (re)started, maybe as another version: ask for its tools again.
             self.refresh();
         }
-        let call = tokio::time::timeout(CALL_TIMEOUT, lease.peer.call_tool_once(params));
+        let limit = self.timings.call_timeout;
+        let call = tokio::time::timeout(limit, lease.peer.call_tool_once(params));
         tokio::select! {
             result = call => match result {
                 Ok(Ok(response)) => {
@@ -586,10 +592,32 @@ impl Upstream {
                     }
                     Err(self.convert(e))
                 }
-                Err(_) => Err(UpstreamError::Other("tools/call timed out".into())),
+                Err(_) => {
+                    self.check_alive(lease.peer.clone(), lease.id);
+                    Err(UpstreamError::Other(format!(
+                        "tools/call timed out after {}s",
+                        limit.as_secs()
+                    )))
+                }
             },
             _ = cancel.cancelled() => Err(UpstreamError::Other("cancelled by the client".into())),
         }
+    }
+
+    /// After a call on connection `id` timed out. The call was cancelled, but a server that
+    /// is stuck does not act on that: if it does not even answer a ping, drop the connection
+    /// (for a command server: kill it), so that the next request gets a new one.
+    fn check_alive(&self, peer: Peer<RoleClient>, id: u64) {
+        let Some(me) = self.me.upgrade() else { return };
+        tokio::spawn(async move {
+            let ping = peer.send_request(ClientRequest::PingRequest(Default::default()));
+            let answer = tokio::time::timeout(me.timings.ping_timeout, ping).await;
+            // An error for an answer still shows that it is listening.
+            if !matches!(answer, Ok(Ok(_) | Err(ServiceError::McpError(_)))) {
+                tracing::warn!("[{}] not responding: disconnecting", me.name());
+                me.reset(id).await;
+            }
+        });
     }
 
     /// Disconnect; a command server is asked to exit, then killed if it does not.

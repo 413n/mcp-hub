@@ -229,6 +229,9 @@ How it runs:
   Agents still see its tools meanwhile, from the hub's copy of the list, and
   listing them does not start it. Only the first list after the hub itself
   started does, to learn the tools.
+- A tool call may take 5 minutes. When one runs out of time the hub pings the
+  server, and if it does not answer within 5 seconds stops it, so that the next
+  call gets a new process instead of one that is stuck.
 - It runs in `cwd` (else the hub's directory), not in the agent's project, and
   agents' MCP roots are not forwarded. Servers meant to work on "the current
   repo" (filesystem, git) are better configured in each agent directly.
