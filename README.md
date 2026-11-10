@@ -181,6 +181,17 @@ stdio server, see [Local (stdio) servers](#local-stdio-servers)).
   that long without a tool call (the next call opens a new one). Off by default:
   an open session costs the hub nothing. See [Local (stdio) servers](#local-stdio-servers),
   where it matters.
+- `skipWhenEnv`: optional, the name of an environment variable. An agent started
+  with that variable set does not get this server: it is not in its tool list
+  or in the instructions, and a call to it is refused with a note. For a server
+  whose application also gives its own agents the same tools directly, where
+  the hub's copies would be duplicates the agent can pick by mistake. T3 Code
+  is one: it sets `T3CODE_THREAD_ID` for the agents it runs, so
+  `"skipWhenEnv": "T3CODE_THREAD_ID"` on the `t3code` server keeps its tools
+  for agents started anywhere else. It is `mcp-hub connect` and
+  `mcp-hub headers` that look at the variable, so this needs the agent set up
+  as in step 2; Codex passes a stdio server only the variables listed in its
+  entry, so add `env_vars = ["T3CODE_THREAD_ID"]` to `[mcp_servers.hub]`.
 
 Then restart the hub and check it:
 

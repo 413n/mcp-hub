@@ -104,7 +104,7 @@ async fn start_hub() -> u16 {
     let fake_port = start_fake(Fake::default()).await;
     let config = parse_config(
         &json!({"servers": {
-            "fake": {"url": format!("http://127.0.0.1:{fake_port}/mcp"), "description": "Echoes things back"},
+            "fake": {"url": format!("http://127.0.0.1:{fake_port}/mcp"), "description": "Echoes things back", "skipWhenEnv": "INSIDE_FAKE"},
             "sentry": {"url": "https://mcp.sentry.dev/mcp", "oauth": {}},
             "local": {
                 "command": "/bin/sh",
@@ -311,7 +311,13 @@ async fn connects_over_stdio() {
     store.set(mcp_hub::TOKEN_KEY, TOKEN).await.unwrap();
     let (agent, bridge) = tokio::io::duplex(1 << 16);
     let (input, output) = tokio::io::split(bridge);
-    tokio::spawn(mcp_hub::connect::run(port, store.clone(), input, output));
+    tokio::spawn(mcp_hub::connect::run(
+        port,
+        store.clone(),
+        Vec::new(),
+        input,
+        output,
+    ));
 
     let client = mcp_hub::upstream::client_info().serve(agent).await.unwrap();
     let instructions = client.peer_info().unwrap().instructions.clone().unwrap();
@@ -337,7 +343,13 @@ async fn connects_over_stdio() {
         .unwrap();
     let (agent, bridge) = tokio::io::duplex(1 << 16);
     let (input, output) = tokio::io::split(bridge);
-    tokio::spawn(mcp_hub::connect::run(port, store.clone(), input, output));
+    tokio::spawn(mcp_hub::connect::run(
+        port,
+        store.clone(),
+        Vec::new(),
+        input,
+        output,
+    ));
     let err = mcp_hub::upstream::client_info().serve(agent).await.err();
     assert!(
         err.as_ref()
@@ -348,10 +360,57 @@ async fn connects_over_stdio() {
     // A token rotated after the bridge started is read again.
     let (agent, bridge) = tokio::io::duplex(1 << 16);
     let (input, output) = tokio::io::split(bridge);
-    tokio::spawn(mcp_hub::connect::run(port, store.clone(), input, output));
+    tokio::spawn(mcp_hub::connect::run(
+        port,
+        store.clone(),
+        Vec::new(),
+        input,
+        output,
+    ));
     tokio::time::sleep(Duration::from_millis(100)).await;
     store.set(mcp_hub::TOKEN_KEY, TOKEN).await.unwrap();
     let client = mcp_hub::upstream::client_info().serve(agent).await.unwrap();
     assert_eq!(client.list_all_tools().await.unwrap().len(), 3);
+    client.cancel().await.unwrap();
+}
+
+/// A server with `skipWhenEnv` is left out for an agent started with that variable.
+#[tokio::test]
+async fn leaves_out_a_skipped_server() {
+    let config = parse_config(
+        r#"{"servers":{"a":{"url":"https://a/","skipWhenEnv":"INSIDE_A"},"b":{"url":"https://b/"}}}"#,
+    )
+    .unwrap();
+    assert_eq!(
+        mcp_hub::connect::skipped(&config, |var| var == "INSIDE_A"),
+        ["a"]
+    );
+    assert!(mcp_hub::connect::skipped(&config, |_| false).is_empty());
+
+    let port = start_hub().await;
+    let store = SecretStore::memory();
+    store.set(mcp_hub::TOKEN_KEY, TOKEN).await.unwrap();
+    let (agent, bridge) = tokio::io::duplex(1 << 16);
+    let (input, output) = tokio::io::split(bridge);
+    let skip = vec!["fake".to_owned()];
+    tokio::spawn(mcp_hub::connect::run(port, store, skip, input, output));
+    let client = mcp_hub::upstream::client_info().serve(agent).await.unwrap();
+
+    let instructions = client.peer_info().unwrap().instructions.clone().unwrap();
+    assert!(!instructions.contains("- fake"), "{instructions}");
+    assert!(instructions.contains("- sentry"), "{instructions}");
+    let tools = client.list_all_tools().await.unwrap();
+    let names: Vec<_> = tools.iter().map(|t| t.name.as_ref()).collect();
+    assert_eq!(names, ["local__env", "local__crash"]);
+    let result = client
+        .call_tool(CallToolRequestParams::new("fake__echo"))
+        .await
+        .unwrap();
+    assert_eq!(result.is_error, Some(true));
+    let text = &result.content[0].as_text().unwrap().text;
+    assert!(
+        text.contains("left out of this session (INSIDE_FAKE is set)"),
+        "{text}"
+    );
     client.cancel().await.unwrap();
 }

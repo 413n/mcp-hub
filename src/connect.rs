@@ -14,6 +14,8 @@ use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader
 use tokio::task::AbortHandle;
 
 use crate::TOKEN_KEY;
+use crate::config::Config;
+use crate::hub::SKIP_HEADER;
 use crate::secrets::SecretStore;
 
 /// Sent on requests after `initialize`, as an HTTP client would.
@@ -28,18 +30,33 @@ async fn token(store: &SecretStore) -> Result<String> {
         .context("no hub token in the keyring yet (run \"mcp-hub token\")")
 }
 
-/// The HTTP headers an agent has to send to the hub.
-pub async fn headers(store: &SecretStore) -> Result<Vec<(&'static str, String)>> {
-    Ok(vec![(
-        "Authorization",
-        format!("Bearer {}", token(store).await?),
-    )])
+/// The servers to leave out for an agent in this environment: those whose `skipWhenEnv`
+/// variable `is_set`.
+pub fn skipped(config: &Config, is_set: impl Fn(&str) -> bool) -> Vec<String> {
+    let skip = |s: &&crate::config::ServerConfig| s.skip_when_env.as_deref().is_some_and(&is_set);
+    let servers = config.servers.iter().filter(skip);
+    servers.map(|s| s.name.clone()).collect()
+}
+
+/// Whether environment variable `name` is set to something.
+pub fn env_is_set(name: &str) -> bool {
+    std::env::var_os(name).is_some_and(|value| !value.is_empty())
+}
+
+/// The HTTP headers an agent has to send to the hub: the token, and the servers to `skip`.
+pub async fn headers(store: &SecretStore, skip: &[String]) -> Result<Vec<(&'static str, String)>> {
+    let mut headers = vec![("Authorization", format!("Bearer {}", token(store).await?))];
+    if !skip.is_empty() {
+        headers.push((SKIP_HEADER, skip.join(",")));
+    }
+    Ok(headers)
 }
 
 struct Bridge<W> {
     url: String,
     http: reqwest::Client,
     store: SecretStore,
+    skip: Vec<String>,
     headers: Mutex<Vec<(&'static str, String)>>,
     /// The version the hub and the agent agreed on, once they have.
     protocol: Mutex<Option<String>>,
@@ -103,7 +120,7 @@ impl<W: AsyncWrite + Unpin + Send + 'static> Bridge<W> {
             // The token was rotated since this started: read the new one, once.
             if status == 401 && !reloaded {
                 reloaded = true;
-                if let Ok(fresh) = headers(&self.store).await {
+                if let Ok(fresh) = headers(&self.store, &self.skip).await {
                     *self.headers.lock().unwrap() = fresh;
                     continue;
                 }
@@ -159,8 +176,15 @@ fn last_event(body: &[u8]) -> Option<Vec<u8>> {
 }
 
 /// Forward MCP messages read from `input`, one JSON object per line, to the hub on `port`
-/// and write its answers to `output`. Returns when `input` ends.
-pub async fn run<R, W>(port: u16, store: SecretStore, input: R, output: W) -> Result<()>
+/// and write its answers to `output`, asking the hub to leave out the servers in `skip`.
+/// Returns when `input` ends.
+pub async fn run<R, W>(
+    port: u16,
+    store: SecretStore,
+    skip: Vec<String>,
+    input: R,
+    output: W,
+) -> Result<()>
 where
     R: AsyncRead + Unpin,
     W: AsyncWrite + Unpin + Send + 'static,
@@ -173,8 +197,9 @@ where
             .no_proxy()
             .pool_max_idle_per_host(0)
             .build()?,
-        headers: Mutex::new(headers(&store).await?),
+        headers: Mutex::new(headers(&store, &skip).await?),
         store,
+        skip,
         protocol: Mutex::new(None),
         output: tokio::sync::Mutex::new(output),
         running: Mutex::new(HashMap::new()),

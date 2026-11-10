@@ -256,15 +256,19 @@ async fn run(args: &[String]) -> Result<ExitCode> {
         (Some("token"), None) => token(store, false).await?,
         (Some("token"), Some("--rotate")) => token(store, true).await?,
         (Some("connect"), None) => {
-            let port = load_config()?.port;
-            connect::run(port, store, tokio::io::stdin(), tokio::io::stdout()).await?
+            let config = load_config()?;
+            let skip = connect::skipped(&config, connect::env_is_set);
+            let (input, output) = (tokio::io::stdin(), tokio::io::stdout());
+            connect::run(config.port, store, skip, input, output).await?
         }
         (Some("headers"), None) => {
-            let headers: serde_json::Map<String, serde_json::Value> = connect::headers(&store)
-                .await?
-                .into_iter()
-                .map(|(name, value)| (name.to_owned(), value.into()))
-                .collect();
+            let skip = connect::skipped(&load_config()?, connect::env_is_set);
+            let headers: serde_json::Map<String, serde_json::Value> =
+                connect::headers(&store, &skip)
+                    .await?
+                    .into_iter()
+                    .map(|(name, value)| (name.to_owned(), value.into()))
+                    .collect();
             println!("{}", serde_json::Value::Object(headers));
         }
         (Some("update"), None) => update::update(None, false).await?,

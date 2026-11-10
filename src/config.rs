@@ -27,6 +27,9 @@ pub struct ServerConfig {
     /// Disconnect (for a command server: stop the process) after this long without a tool
     /// call. `None` keeps it connected.
     pub idle_timeout: Option<Duration>,
+    /// An environment variable: agents started with it set do not get this server. For a
+    /// server that an application also gives its own agents directly.
+    pub skip_when_env: Option<String>,
 }
 
 /// A command server nobody has called for this long is stopped, unless `idleTimeout` says otherwise.
@@ -116,6 +119,7 @@ struct RawServer {
     max_memory_mb: Option<u64>,
     /// Seconds; 0 for never.
     idle_timeout: Option<u64>,
+    skip_when_env: Option<String>,
     description: Option<String>,
     oauth: Option<RawOAuth>,
     bearer: Option<bool>,
@@ -152,7 +156,7 @@ fn is_loopback(url: &Url) -> bool {
     }
 }
 
-/// Conventional names only, so each maps to its own lowercase keyring key.
+/// Conventional names only, so each `secretEnv` maps to its own lowercase keyring key.
 fn valid_secret_env_name(name: &str) -> bool {
     (1..=64).contains(&name.len())
         && !name.starts_with(|c: char| c.is_ascii_digit())
@@ -226,6 +230,12 @@ pub fn parse_config(text: &str) -> Result<Config> {
             bail!("{at}.description: expected a string of at most 300 characters");
         }
         let description = s.description.take();
+        let skip_when_env = s.skip_when_env.take();
+        if let Some(var) = &skip_when_env
+            && !valid_secret_env_name(var)
+        {
+            bail!("{at}.skipWhenEnv: expected the name of an environment variable");
+        }
         // A process costs memory while it waits; a session with an HTTP server costs nothing.
         let idle_timeout = match s.idle_timeout.take() {
             Some(0) => None,
@@ -281,6 +291,7 @@ pub fn parse_config(text: &str) -> Result<Config> {
             description,
             auth,
             idle_timeout,
+            skip_when_env,
         });
     }
     Ok(Config {
@@ -468,6 +479,10 @@ mod tests {
             (
                 r#"{"servers":{"a":{"command":"x","idleTimeout":"10m"}}}"#,
                 "idleTimeout not a number of seconds",
+            ),
+            (
+                r#"{"servers":{"a":{"url":"https://x/","skipWhenEnv":"A B"}}}"#,
+                "skipWhenEnv not a variable name",
             ),
             (r#"{"port":3050,"loginPort":3050}"#, "same ports"),
             (r#"{"port":80}"#, "privileged port"),
