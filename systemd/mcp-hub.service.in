@@ -6,8 +6,13 @@ Requires=dbus.socket
 
 [Service]
 ExecStart=@BIN@ serve
+@ENV@
 Restart=on-failure
 RestartSec=5
+# SIGTERM to the hub only: it lets the calls running finish, then stops its servers itself.
+# Whatever is left after TimeoutStopSec is killed.
+KillMode=mixed
+TimeoutStopSec=15
 # A ceiling for the hub and the local servers it starts together, against one that leaks.
 # Above MemoryHigh they are slowed down and swapped out; at MemoryMax the kernel kills the
 # largest process, and OOMPolicy=continue keeps the hub and the other servers running (the

@@ -66,14 +66,13 @@ if [ ! -f "$config" ]; then
   say "Created $config (no servers yet)."
 fi
 
+# Installs the binary, creates the hub token if missing, (re)starts the service and checks
+# that the hub answers; if it does not, it says how to start it.
 bash "$tmp/$name/install-service.sh"
 
 bin="$HOME/.local/bin/mcp-hub"
-# Create the hub token if missing; the service waits for it.
-"$bin" token >/dev/null
-
 say ""
-say "mcp-hub $version is running on http://127.0.0.1:3050/mcp"
+say "mcp-hub $version is installed and running."
 say ""
 say "Next steps (https://github.com/$REPO#2-connect-your-agents):"
 say "  1. Connect an agent, e.g. Claude Code:"

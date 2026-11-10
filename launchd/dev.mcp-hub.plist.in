@@ -3,7 +3,7 @@
 <plist version="1.0">
 <dict>
   <key>Label</key>
-  <string>dev.mcp-hub</string>
+  <string>@LABEL@</string>
   <key>ProgramArguments</key>
   <array>
     <string>@BIN@</string>
@@ -16,6 +16,9 @@
     <key>SuccessfulExit</key>
     <false/>
   </dict>
+  <!-- The hub stops within a few seconds; after this long it is killed. -->
+  <key>ExitTimeOut</key>
+  <integer>15</integer>
   <key>ThrottleInterval</key>
   <integer>5</integer>
   <key>ProcessType</key>
@@ -23,8 +26,9 @@
   <key>Umask</key>
   <integer>63</integer>
   <key>StandardErrorPath</key>
-  <string>@HOME@/Library/Logs/mcp-hub.log</string>
+  <string>@LOG@</string>
   <key>StandardOutPath</key>
-  <string>@HOME@/Library/Logs/mcp-hub.log</string>
+  <string>@LOG@</string>
+@ENV@
 </dict>
 </plist>
