@@ -10,12 +10,12 @@ use std::sync::{Arc, LazyLock, Weak};
 use std::time::{Duration, Instant};
 
 use rmcp::{
-    Peer, RoleClient, ServiceError, ServiceExt,
+    ClientHandler, Peer, RoleClient, ServiceError, ServiceExt,
     model::{
         CallToolRequestParams, CallToolResponse, ClientCapabilities, ClientConfig, Implementation,
         Tool,
     },
-    service::RunningService,
+    service::{NotificationContext, RunningService},
     transport::{
         StreamableHttpClientTransport, TokioChildProcess,
         auth::{AuthClient, AuthorizationManager},
@@ -40,7 +40,26 @@ const STDERR_TAIL: usize = 20;
 /// The longest an upstream that keeps failing is left alone between attempts.
 const MAX_RETRY_DELAY: Duration = Duration::from_secs(300);
 
-type Client = RunningService<RoleClient, ClientConfig>;
+/// The hub as an upstream's MCP client: it only listens for the tools changing.
+struct Handler {
+    upstream: Weak<Upstream>,
+}
+
+impl ClientHandler for Handler {
+    fn get_info(&self) -> ClientConfig {
+        client_info()
+    }
+
+    async fn on_tool_list_changed(&self, _context: NotificationContext<RoleClient>) {
+        if let Some(upstream) = self.upstream.upgrade() {
+            tracing::debug!("[{}] tools changed", upstream.name());
+            upstream.refresh_again.store(true, Ordering::Release);
+            upstream.refresh();
+        }
+    }
+}
+
+type Client = RunningService<RoleClient, Handler>;
 
 /// A live connection to the upstream; for a command server, dropping it kills the process.
 struct Conn {
@@ -182,6 +201,8 @@ pub struct Upstream {
     refreshing: AtomicBool,
     /// Bumped when a background refresh ends, whatever its outcome.
     refreshed: watch::Sender<u64>,
+    /// The tools changed while a refresh was running: it has to fetch them once more.
+    refresh_again: AtomicBool,
 }
 
 /// Marks the background refresh as over, also if it panicked.
@@ -213,11 +234,18 @@ impl Upstream {
             failing: std::sync::Mutex::new(None),
             refreshing: AtomicBool::new(false),
             refreshed: watch::channel(0).0,
+            refresh_again: AtomicBool::new(false),
         })
     }
 
     pub fn name(&self) -> &str {
         &self.server.name
+    }
+
+    fn handler(&self) -> Handler {
+        Handler {
+            upstream: self.me.clone(),
+        }
     }
 
     async fn connect(&self) -> Result<Client, UpstreamError> {
@@ -270,7 +298,7 @@ impl Upstream {
                 UpstreamError::Other(format!("cannot start {}: {e}{hint}", stdio.command))
             })?;
         let stderr = stderr.map(|s| tokio::spawn(log_stderr(name.clone(), s)));
-        match client_info().serve(transport).await {
+        match self.handler().serve(transport).await {
             Ok(client) => Ok(client),
             Err(e) => {
                 // The failed handshake dropped the transport, which kills the process; what it
@@ -295,7 +323,7 @@ impl Upstream {
             Auth::None => {
                 let transport =
                     StreamableHttpClientTransport::with_client(http_client(url), config);
-                client_info().serve(transport).await
+                self.handler().serve(transport).await
             }
             Auth::Bearer => {
                 let token = self
@@ -312,7 +340,7 @@ impl Upstream {
                     http_client(url),
                     config.auth_header(token),
                 );
-                client_info().serve(transport).await
+                self.handler().serve(transport).await
             }
             Auth::OAuth { .. } => {
                 // Read the keyring fresh on every connect: `mcp-hub login` may have run meanwhile.
@@ -330,7 +358,7 @@ impl Upstream {
                     )));
                 }
                 let http = AuthClient::new(http_client(url), manager);
-                client_info()
+                self.handler()
                     .serve(StreamableHttpClientTransport::with_client(http, config))
                     .await
             }
@@ -515,9 +543,21 @@ impl Upstream {
             return;
         }
         tokio::spawn(async move {
-            let done = RefreshDone(me);
-            if let Err(e) = done.0.list_tools().await {
-                tracing::warn!("[{}] tools/list failed: {e}", done.0.name());
+            let done = RefreshDone(me.clone());
+            loop {
+                me.refresh_again.store(false, Ordering::Release);
+                if let Err(e) = me.list_tools().await {
+                    tracing::warn!("[{}] tools/list failed: {e}", me.name());
+                    break;
+                }
+                if !me.refresh_again.load(Ordering::Acquire) {
+                    break;
+                }
+            }
+            drop(done);
+            // A change that came between the last check and the end.
+            if me.refresh_again.load(Ordering::Acquire) {
+                me.refresh();
             }
         });
     }
@@ -529,6 +569,10 @@ impl Upstream {
         cancel: CancellationToken,
     ) -> Result<CallToolResponse, UpstreamError> {
         let lease = self.lease(true).await?;
+        if lease.fresh {
+            // The server just (re)started, maybe as another version: ask for its tools again.
+            self.refresh();
+        }
         let call = tokio::time::timeout(CALL_TIMEOUT, lease.peer.call_tool_once(params));
         tokio::select! {
             result = call => match result {

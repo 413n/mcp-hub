@@ -182,7 +182,9 @@ reconnect; Cursor: toggle the server in settings).
 The hub keeps each server's tool list in memory and answers agents from that
 copy, so an agent connecting does not wait for the upstreams. A copy older than
 5 minutes is still served, and refreshed in the background for the next agent:
-a tool an upstream just added can take one more reconnect to show up. Only
+a tool an upstream just added can take one more reconnect to show up. The copy
+is also refreshed when a server announces that its tools changed
+(`notifications/tools/list_changed`) and whenever a local server starts. Only
 right after the hub starts are the upstreams asked directly, each for at most
 5 seconds; a slower one is left out of that first list and appears in the next.
 

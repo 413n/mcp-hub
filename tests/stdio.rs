@@ -232,3 +232,43 @@ async fn stops_an_idle_server() {
     local.close().await;
     assert!(!log.running());
 }
+
+/// Wait until the cached tool list has `n` tools.
+async fn cached_tools(upstream: &Upstream, n: usize) -> bool {
+    for _ in 0..40 {
+        if upstream.tools().await.is_some_and(|tools| tools.len() == n) {
+            return true;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    false
+}
+
+#[tokio::test]
+async fn follows_a_changing_tool_list() {
+    // Not a start log here, only a file that exists or not.
+    let flag = StartLog::new("more");
+    let local = upstream(
+        json!({
+            "command": "/bin/sh",
+            "args": [fixtures().join("stdio-server.sh")],
+            "env": {"MORE_FLAG": flag.0},
+        }),
+        &SecretStore::memory(),
+    );
+    assert_eq!(local.tools().await.unwrap().len(), 2);
+
+    // The cached list is recent, so a change goes unnoticed...
+    std::fs::write(&flag.0, "").unwrap();
+    assert_eq!(local.tools().await.unwrap().len(), 2);
+    // ...until the server says its tools changed.
+    assert_eq!(call_text(&local, "notify").await.unwrap(), "notified");
+    assert!(cached_tools(&local, 3).await);
+
+    // A server that starts again may be another version: its tools are fetched again.
+    std::fs::remove_file(&flag.0).unwrap();
+    assert!(call_text(&local, "crash").await.is_err());
+    assert!(call_text(&local, "env").await.is_ok());
+    assert!(cached_tools(&local, 2).await);
+    local.close().await;
+}
