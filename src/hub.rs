@@ -272,6 +272,19 @@ impl Hub {
         (self.version(changes), pending)
     }
 
+    /// Ask every server for its tools now, all at once: how many it has, or why it failed.
+    /// In config order.
+    pub async fn status(&self) -> Vec<(String, Result<usize, String>)> {
+        let asking = self.upstreams.iter().map(|u| async move {
+            let listed = u.list_tools().await;
+            (
+                u.name().to_owned(),
+                listed.map(|t| t.len()).map_err(|e| e.to_string()),
+            )
+        });
+        futures::future::join_all(asking).await
+    }
+
     fn version(&self, changes: u64) -> String {
         format!("{:x}-{changes}", self.started)
     }

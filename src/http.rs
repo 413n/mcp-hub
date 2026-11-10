@@ -4,8 +4,9 @@
 //! header (agents never send one; browsers always do on POST), path, token,
 //! method. Then rmcp's stateless Streamable HTTP handler takes over.
 //!
-//! One more path, [`RELOAD_PATH`], has the hub read its token from the keyring again: for
-//! `mcp-hub token --rotate`, with the token it replaces.
+//! Two more paths, for `mcp-hub` itself and with the token too: [`RELOAD_PATH`] has the hub
+//! read its token from the keyring again (`mcp-hub token --rotate`), [`STATUS_PATH`] has it
+//! ask every server for its tools (`mcp-hub status`).
 
 use std::convert::Infallible;
 use std::net::SocketAddr;
@@ -36,6 +37,8 @@ type Body = BoxBody<Bytes, Infallible>;
 
 /// POST here with the current token, and the hub takes the one in the keyring instead.
 pub const RELOAD_PATH: &str = "/reload-token";
+/// POST here, and the hub answers how each server is, as [`ServerStatus`]es.
+pub const STATUS_PATH: &str = "/status";
 /// On every answer: changes whenever the tools the agent gets change.
 pub const TOOLS_HEADER: &str = "x-mcp-hub-tools";
 /// On an answer while some servers have yet to say what tools they have: how many.
@@ -86,7 +89,8 @@ impl Endpoint {
             return reject(StatusCode::FORBIDDEN, "browser requests are not allowed");
         }
         let reload = req.uri().path() == RELOAD_PATH && self.store.is_some();
-        if req.uri().path() != "/mcp" && !reload {
+        let status = req.uri().path() == STATUS_PATH;
+        if req.uri().path() != "/mcp" && !reload && !status {
             return reject(StatusCode::NOT_FOUND, "not found");
         }
         let auth = req
@@ -103,6 +107,28 @@ impl Endpoint {
         }
         if reload {
             return self.reload().await;
+        }
+        if status {
+            let servers = self.hub.status().await.into_iter();
+            let servers: Vec<_> = servers
+                .map(|(name, listed)| match listed {
+                    Ok(tools) => ServerStatus {
+                        name,
+                        tools: Some(tools),
+                        error: None,
+                    },
+                    Err(error) => ServerStatus {
+                        name,
+                        tools: None,
+                        error: Some(error),
+                    },
+                })
+                .collect();
+            let body = serde_json::to_vec(&servers).unwrap_or_default();
+            let mut res = Response::new(Full::new(Bytes::from(body)).boxed());
+            res.headers_mut()
+                .insert(header::CONTENT_TYPE, "application/json".parse().unwrap());
+            return res;
         }
         // Taken before the request is handled: a list made after it has at least these tools.
         let (version, pending) = self.hub.tools_version(&crate::hub::skipped(req.headers()));
@@ -232,6 +258,38 @@ pub async fn serve_with(
     }
     handlers.cancel();
     Ok(())
+}
+
+/// How one server is, as the running hub found it.
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
+pub struct ServerStatus {
+    pub name: String,
+    /// How many tools it has, if it answered.
+    pub tools: Option<usize>,
+    /// Why not, if it did not.
+    pub error: Option<String>,
+}
+
+/// Ask the hub on `port` how its servers are. `None` if no hub that can answer this runs
+/// there (none at all, or an older version).
+pub async fn status(port: u16, token: &str) -> anyhow::Result<Option<Vec<ServerStatus>>> {
+    let url = format!("http://127.0.0.1:{port}{STATUS_PATH}");
+    // A server may take up to a minute and a half to connect and list its tools.
+    let client = reqwest::Client::builder()
+        .no_proxy()
+        .timeout(Duration::from_secs(100))
+        .build()?;
+    let res = match client.post(url).bearer_auth(token).send().await {
+        Ok(res) => res,
+        Err(e) if e.is_connect() => return Ok(None),
+        Err(e) => anyhow::bail!("the hub did not answer: {e}"),
+    };
+    match res.status().as_u16() {
+        200 => Ok(Some(res.json().await?)),
+        404 => Ok(None),
+        401 => anyhow::bail!("the hub did not take the token in the keyring"),
+        status => anyhow::bail!("the hub answered {status}"),
+    }
 }
 
 /// What came of asking the running hub to take the token in the keyring.

@@ -62,9 +62,12 @@ the command that starts it. Check at any time with:
 
     mcp-hub check              # or: curl -s -o /dev/null -w '%{http_code}\n' http://127.0.0.1:3050/mcp (401 = running)
 
-**macOS:** the first time the hub reads the Keychain, macOS asks whether
-`mcp-hub` may access it: choose *Always Allow*. Each rebuild is a new binary to
-macOS, so it asks again once after every `install-service.sh`.
+**macOS:** the first time `mcp-hub` reads the Keychain, macOS asks for your
+password to let it: choose *Always Allow*. Each update or rebuild is a new
+binary to macOS, so it asks again once after every `install-service.sh`. Once:
+all of mcp-hub's secrets are in a single Keychain item. (Versions up to 0.4 kept
+one item per secret. The first time 0.5 or later needs one of those, macOS asks
+for it one last time while it moves into the single item.)
 
 ## 2. Connect your agents
 
@@ -359,7 +362,7 @@ How it runs:
 
 ## Day to day
 
-    mcp-hub status             # can every upstream be reached?
+    mcp-hub status             # can every upstream be reached? (asks the running hub)
     mcp-hub stats              # what the hub did lately (see "Measurements")
     mcp-hub login <server>     # OAuth login in the browser (also to re-login)
     mcp-hub logout <server>    # delete stored credentials for a server
@@ -386,7 +389,12 @@ starts.
 Update: `mcp-hub update` for one-line installs (it runs that release's
 `install.sh`: checksum check, binary swap, service restart; config, logins and
 token stay). For a clone: `git pull && bin/install-service.sh`. On macOS the
-Keychain may ask once more after an update: choose *Always Allow*.
+Keychain asks once more after an update, during the install: choose *Always
+Allow*.
+
+`mcp-hub status` asks the running hub, which has the servers' logins at hand
+and checks them all at once; only when no hub runs does it connect to each
+server itself.
 
 Logs (`RUST_LOG=debug` in the service environment for more detail; local
 servers' stderr is logged at `info` under the target `mcp_hub::stderr`, so
@@ -475,12 +483,14 @@ dropped when full; delete the directory to start over.
 - Every request must come from loopback, have the exact `Host`
   (`127.0.0.1:3050` or `localhost:3050`), no `Origin` header (so browser pages
   are refused), and the bearer token (compared in constant time).
-- Besides `/mcp`, the hub answers one path, `/reload-token`, used by
-  `mcp-hub token --rotate`: with the current token, it makes the hub read the
-  token from the keyring again. Nothing else.
+- Besides `/mcp`, the hub answers two paths, with the token too, for `mcp-hub`
+  itself: `/reload-token` (`token --rotate`) makes it read its token from the
+  keyring again, `/status` (`status`) has it ask every server for its tools and
+  answers with the count or the error per server. Nothing else.
 - Upstream OAuth credentials, static tokens and the hub token live in the OS
   keyring: on Linux the Secret Service (schema `dev.mcp-hub.Secret`, attribute
-  `key`), on macOS the login Keychain (generic passwords, service `mcp-hub`).
+  `key`), on macOS the login Keychain (one generic password, service `mcp-hub`,
+  account `mcp-hub/vault`, holding them all as JSON).
   Nothing secret is written to disk by mcp-hub, and nothing is synced between
   machines.
 - The record for `mcp-hub stats` says which tools were called, when and by which

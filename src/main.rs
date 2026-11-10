@@ -133,7 +133,40 @@ async fn serve(config: Config, store: SecretStore) -> Result<()> {
     Ok(())
 }
 
+/// `mcp-hub status`: asked of the running hub, which has the servers' credentials at hand;
+/// only if none runs does this connect to each server itself (and read each one's
+/// credentials from the keyring).
 async fn status(config: Config, store: SecretStore) -> Result<bool> {
+    let asked = match store.get(TOKEN_KEY).await? {
+        Some(token) => http::status(config.port, &token).await,
+        None => Ok(None),
+    };
+    match asked {
+        Ok(Some(servers)) => {
+            let mut ok = true;
+            for server in &servers {
+                match (&server.tools, &server.error) {
+                    (Some(tools), _) => println!("ok    {}: {tools} tools", server.name),
+                    (None, error) => {
+                        ok = false;
+                        let error = error.as_deref().unwrap_or("no answer");
+                        println!("FAIL  {}: {error}", server.name);
+                    }
+                }
+            }
+            let running: Vec<_> = servers.iter().map(|s| s.name.as_str()).collect();
+            let configured: Vec<_> = config.servers.iter().map(|s| s.name.as_str()).collect();
+            if running != configured {
+                println!(
+                    "The config changed since the hub started: restart it to apply ({}).",
+                    update::start_command()
+                );
+            }
+            return Ok(ok);
+        }
+        Ok(None) => println!("(No hub running that can say: asking each server from here.)"),
+        Err(e) => println!("({e:#}: asking each server from here.)"),
+    }
     let mut ok = true;
     for upstream in upstreams(&config, &store) {
         match upstream.list_tools().await {

@@ -936,3 +936,21 @@ async fn remembers_tool_lists() {
     assert!(other.tools().await.is_none());
     std::fs::remove_dir_all(&dir).unwrap();
 }
+
+/// `mcp-hub status`, asked of the running hub.
+#[tokio::test]
+async fn reports_status() {
+    let port = start_hub().await;
+    let servers = http::status(port, TOKEN).await.unwrap().unwrap();
+    let names: Vec<_> = servers.iter().map(|s| s.name.as_str()).collect();
+    assert_eq!(names, ["fake", "sentry", "local"]);
+    assert_eq!(servers[0].tools, Some(2));
+    assert!(servers[1].tools.is_none());
+    let error = servers[1].error.as_deref().unwrap();
+    assert!(error.contains("mcp-hub login sentry"), "{error}");
+    assert!(servers[2].tools.is_some_and(|n| n > 0), "{:?}", servers[2]);
+
+    assert!(http::status(port, "wrong").await.is_err());
+    let free = http::bind(0).await.unwrap().local_addr().unwrap().port();
+    assert!(http::status(free, TOKEN).await.unwrap().is_none());
+}
