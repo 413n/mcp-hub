@@ -2,6 +2,7 @@
 
 use std::collections::BTreeMap;
 use std::path::PathBuf;
+use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
 use serde::Deserialize;
@@ -23,7 +24,13 @@ pub struct ServerConfig {
     pub description: Option<String>,
     /// Always `Auth::None` for a command server: its secrets are in `StdioCommand::secret_env`.
     pub auth: Auth,
+    /// Disconnect (for a command server: stop the process) after this long without a tool
+    /// call. `None` keeps it connected.
+    pub idle_timeout: Option<Duration>,
 }
+
+/// A command server nobody has called for this long is stopped, unless `idleTimeout` says otherwise.
+const DEFAULT_IDLE_TIMEOUT: Duration = Duration::from_secs(600);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Endpoint {
@@ -104,6 +111,8 @@ struct RawServer {
     env: Option<BTreeMap<String, String>>,
     cwd: Option<String>,
     secret_env: Option<Vec<String>>,
+    /// Seconds; 0 for never.
+    idle_timeout: Option<u64>,
     description: Option<String>,
     oauth: Option<RawOAuth>,
     bearer: Option<bool>,
@@ -208,6 +217,13 @@ pub fn parse_config(text: &str) -> Result<Config> {
             bail!("{at}.description: expected a string of at most 300 characters");
         }
         let description = s.description.take();
+        // A process costs memory while it waits; a session with an HTTP server costs nothing.
+        let idle_timeout = match s.idle_timeout.take() {
+            Some(0) => None,
+            Some(secs) => Some(Duration::from_secs(secs)),
+            None if s.command.is_some() => Some(DEFAULT_IDLE_TIMEOUT),
+            None => None,
+        };
         match (s.kind.as_deref(), &s.url) {
             (None | Some("stdio"), None) | (None | Some("http"), Some(_)) => {}
             (Some(kind), _) => {
@@ -249,6 +265,7 @@ pub fn parse_config(text: &str) -> Result<Config> {
             endpoint,
             description,
             auth,
+            idle_timeout,
         });
     }
     Ok(Config {
@@ -296,6 +313,7 @@ mod tests {
         .unwrap();
         let p = &c.servers[0];
         assert_eq!(p.auth, Auth::None);
+        assert_eq!(p.idle_timeout, Some(DEFAULT_IDLE_TIMEOUT));
         assert_eq!(
             p.endpoint,
             Endpoint::Stdio(StdioCommand {
@@ -308,6 +326,22 @@ mod tests {
         );
         assert!(
             matches!(&c.servers[1].endpoint, Endpoint::Stdio(s) if s.args.is_empty() && s.cwd.is_none())
+        );
+    }
+
+    #[test]
+    fn idle_timeout() {
+        let c = parse_config(
+            r#"{"servers":{
+                "a":{"command":"x"},"b":{"command":"x","idleTimeout":30},"c":{"command":"x","idleTimeout":0},
+                "d":{"url":"https://d/"},"e":{"url":"https://e/","idleTimeout":120}
+            }}"#,
+        )
+        .unwrap();
+        let secs = |n| Some(Duration::from_secs(n));
+        assert_eq!(
+            c.servers.iter().map(|s| s.idle_timeout).collect::<Vec<_>>(),
+            [secs(600), secs(30), None, None, secs(120)]
         );
     }
 
@@ -405,6 +439,10 @@ mod tests {
             (
                 r#"{"servers":{"a":{"type":"sse","url":"https://x/"}}}"#,
                 "type sse",
+            ),
+            (
+                r#"{"servers":{"a":{"command":"x","idleTimeout":"10m"}}}"#,
+                "idleTimeout not a number of seconds",
             ),
             (r#"{"port":3050,"loginPort":3050}"#, "same ports"),
             (r#"{"port":80}"#, "privileged port"),

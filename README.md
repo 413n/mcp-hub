@@ -167,6 +167,10 @@ stdio server, see [Local (stdio) servers](#local-stdio-servers)).
     For GitHub use a fine-grained personal access token limited to the repos and
     permissions you want agents to have.
   - neither, for servers that need no authentication.
+- `idleTimeout`: optional, in seconds; close the session with the server after
+  that long without a tool call (the next call opens a new one). Off by default:
+  an open session costs the hub nothing. See [Local (stdio) servers](#local-stdio-servers),
+  where it matters.
 
 Then restart the hub and check it:
 
@@ -203,6 +207,8 @@ an agent works, with a `description` added:
 - `secretEnv`: optional list of environment variables whose values are kept in
   the keyring instead of the config, e.g. `"secretEnv": ["GITHUB_TOKEN"]`.
   Store each with `mcp-hub set-token <name> <VAR>` (input hidden).
+- `idleTimeout`: optional, in seconds; how long the server may go without a tool
+  call before the hub stops it. 600 (10 minutes) by default, `0` to never stop it.
 
 **`PATH` is minimal.** The service does not load your shell profile, so it
 typically sees only system directories such as `/usr/bin` and `/bin`: Homebrew,
@@ -216,6 +222,11 @@ How it runs:
 - Started on first use, shared by every agent, and restarted on the next request
   if it exits. It runs in its own process group, so stopping it also stops
   anything it started.
+- Stopped when no agent has called one of its tools for `idleTimeout`, and
+  started again by the next call, which then also waits for the server to start.
+  Agents still see its tools meanwhile, from the hub's copy of the list, and
+  listing them does not start it. Only the first list after the hub itself
+  started does, to learn the tools.
 - It runs in `cwd` (else the hub's directory), not in the agent's project, and
   agents' MCP roots are not forwarded. Servers meant to work on "the current
   repo" (filesystem, git) are better configured in each agent directly.

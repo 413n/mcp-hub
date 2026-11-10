@@ -42,10 +42,25 @@ impl StartLog {
         Self(path)
     }
 
-    fn starts(&self) -> usize {
+    fn lines(&self) -> Vec<String> {
         std::fs::read_to_string(&self.0)
-            .map(|s| s.lines().count())
-            .unwrap_or(0)
+            .map(|s| s.lines().map(str::to_owned).collect())
+            .unwrap_or_default()
+    }
+
+    fn starts(&self) -> usize {
+        self.lines().len()
+    }
+
+    /// Whether the process that started last is still there.
+    fn running(&self) -> bool {
+        let pid = self.lines().pop().expect("a started process");
+        std::process::Command::new("kill")
+            .args(["-0", &pid])
+            .stderr(std::process::Stdio::null())
+            .status()
+            .unwrap()
+            .success()
     }
 }
 
@@ -173,4 +188,47 @@ async fn leaves_a_failing_server_alone_for_a_while() {
     tokio::time::sleep(Duration::from_millis(500)).await;
     assert!(broken.list_tools().await.is_err());
     assert_eq!(log.starts(), 2);
+}
+
+#[tokio::test]
+async fn stops_an_idle_server() {
+    let log = StartLog::new("idle");
+    let local = upstream_with(
+        json!({
+            "command": "/bin/sh",
+            "args": [fixtures().join("stdio-server.sh")],
+            "env": {"START_LOG": log.0},
+            "idleTimeout": 1,
+        }),
+        &SecretStore::memory(),
+        Timings {
+            list_ttl: Duration::from_millis(100),
+            ..Timings::default()
+        },
+    );
+
+    // Nothing cached yet: the list starts it.
+    assert_eq!(local.tools().await.unwrap().len(), 2);
+    assert_eq!(log.starts(), 1);
+    assert!(log.running());
+
+    // A call longer than the idle time is not cut off.
+    assert_eq!(call_text(&local, "slow").await.unwrap(), "slow done");
+    assert_eq!(log.starts(), 1);
+    assert!(log.running());
+
+    // Left alone, it is stopped. Its tools are still listed, old as the list is, without
+    // starting it again.
+    tokio::time::sleep(Duration::from_millis(1500)).await;
+    assert!(!log.running());
+    assert_eq!(local.tools().await.unwrap().len(), 2);
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert_eq!(log.starts(), 1);
+
+    // The next call starts it again.
+    assert!(call_text(&local, "env").await.is_ok());
+    assert_eq!(log.starts(), 2);
+    assert!(log.running());
+    local.close().await;
+    assert!(!log.running());
 }

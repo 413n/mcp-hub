@@ -5,12 +5,12 @@
 
 use std::collections::VecDeque;
 use std::process::Stdio;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, LazyLock, Weak};
 use std::time::{Duration, Instant};
 
 use rmcp::{
-    RoleClient, ServiceError, ServiceExt,
+    Peer, RoleClient, ServiceError, ServiceExt,
     model::{
         CallToolRequestParams, CallToolResponse, ClientCapabilities, ClientConfig, Implementation,
         Tool,
@@ -41,6 +41,34 @@ const STDERR_TAIL: usize = 20;
 const MAX_RETRY_DELAY: Duration = Duration::from_secs(300);
 
 type Client = RunningService<RoleClient, ClientConfig>;
+
+/// A live connection to the upstream; for a command server, dropping it kills the process.
+struct Conn {
+    /// Tells this connection from the ones before and after it.
+    id: u64,
+    service: Client,
+}
+
+/// A connection lent to one request. While it exists the upstream counts as busy, so the
+/// connection is not closed for being idle.
+struct Lease<'a> {
+    upstream: &'a Upstream,
+    peer: Peer<RoleClient>,
+    id: u64,
+    /// The connection was made for this request.
+    fresh: bool,
+    /// A tool call: the idle time starts again when it ends.
+    in_use: bool,
+}
+
+impl Drop for Lease<'_> {
+    fn drop(&mut self) {
+        if self.in_use {
+            *self.upstream.last_used.lock().unwrap() = Instant::now();
+        }
+        self.upstream.busy.fetch_sub(1, Ordering::AcqRel);
+    }
+}
 
 #[derive(Debug, thiserror::Error)]
 pub enum UpstreamError {
@@ -142,7 +170,12 @@ pub struct Upstream {
     timings: Timings,
     /// For the background tasks, which must not keep a dropped upstream alive.
     me: Weak<Upstream>,
-    client: Mutex<Option<Arc<Client>>>,
+    conn: Mutex<Option<Conn>>,
+    connections: AtomicU64,
+    /// Requests in flight. Goes up only under the `conn` lock, where the idle check reads it.
+    busy: AtomicUsize,
+    /// When the last tool call ended, or the connection was made if that is later.
+    last_used: std::sync::Mutex<Instant>,
     cache: std::sync::Mutex<Option<CachedTools>>,
     failing: std::sync::Mutex<Option<Failing>>,
     /// Set while a background refresh of `cache` runs, so that there is only one.
@@ -172,7 +205,10 @@ impl Upstream {
             store,
             timings,
             me: me.clone(),
-            client: Mutex::new(None),
+            conn: Mutex::new(None),
+            connections: AtomicU64::new(0),
+            busy: AtomicUsize::new(0),
+            last_used: std::sync::Mutex::new(Instant::now()),
             cache: std::sync::Mutex::new(None),
             failing: std::sync::Mutex::new(None),
             refreshing: AtomicBool::new(false),
@@ -308,13 +344,24 @@ impl Upstream {
         })
     }
 
-    /// The connection, made now if there is none, and whether it was.
-    async fn client(&self) -> Result<(Arc<Client>, bool), UpstreamError> {
-        let mut slot = self.client.lock().await;
-        if let Some(client) = slot.as_ref()
-            && !client.is_closed()
+    /// Borrow the connection for one request, making it now if there is none. `in_use`
+    /// says the request is a tool call, the only kind that keeps an idle upstream connected.
+    async fn lease(&self, in_use: bool) -> Result<Lease<'_>, UpstreamError> {
+        let mut slot = self.conn.lock().await;
+        let lease = |conn: &Conn, fresh| {
+            self.busy.fetch_add(1, Ordering::AcqRel);
+            Lease {
+                upstream: self,
+                peer: conn.service.peer().clone(),
+                id: conn.id,
+                fresh,
+                in_use,
+            }
+        };
+        if let Some(conn) = slot.as_ref()
+            && !conn.service.is_closed()
         {
-            return Ok((client.clone(), false));
+            return Ok(lease(conn, false));
         }
         if let Some(e) = self.failing() {
             return Err(e);
@@ -323,10 +370,14 @@ impl Upstream {
             .await
             .unwrap_or_else(|_| Err(UpstreamError::Other("connection timed out".into())));
         match connected {
-            Ok(client) => {
-                let client = Arc::new(client);
-                *slot = Some(client.clone());
-                Ok((client, true))
+            Ok(service) => {
+                let id = self.connections.fetch_add(1, Ordering::Relaxed);
+                let conn = slot.insert(Conn { id, service });
+                *self.last_used.lock().unwrap() = Instant::now();
+                if let Some(idle) = self.server.idle_timeout {
+                    tokio::spawn(close_when_idle(self.me.clone(), id, idle));
+                }
+                Ok(lease(conn, true))
             }
             Err(e) => {
                 self.failed(&e);
@@ -335,9 +386,19 @@ impl Upstream {
         }
     }
 
-    /// Drop the connection so the next request reconnects.
-    async fn reset(&self) {
-        self.client.lock().await.take();
+    /// Drop connection `id`, if it is still the current one, so the next request reconnects.
+    async fn reset(&self, id: u64) {
+        let mut slot = self.conn.lock().await;
+        if slot.as_ref().is_some_and(|conn| conn.id == id) {
+            slot.take();
+        }
+    }
+
+    /// Whether the upstream is connected right now (a command server: running).
+    fn connected(&self) -> bool {
+        self.conn
+            .try_lock()
+            .is_ok_and(|slot| slot.as_ref().is_some_and(|c| !c.service.is_closed()))
     }
 
     fn convert(&self, err: ServiceError) -> UpstreamError {
@@ -383,8 +444,9 @@ impl Upstream {
     /// Ask the upstream for its tools, under their own names. Also updates the cached list.
     pub async fn list_tools(&self) -> Result<Vec<Tool>, UpstreamError> {
         for attempt in 0..2 {
-            let (client, fresh) = self.client().await?;
-            let error = match tokio::time::timeout(LIST_TIMEOUT, client.list_all_tools()).await {
+            let lease = self.lease(false).await?;
+            let listing = tokio::time::timeout(LIST_TIMEOUT, lease.peer.list_all_tools()).await;
+            let error = match listing {
                 Ok(Ok(tools)) => {
                     self.succeeded();
                     *self.cache.lock().unwrap() = Some(CachedTools {
@@ -395,16 +457,16 @@ impl Upstream {
                 }
                 Ok(Err(ServiceError::McpError(e))) => UpstreamError::Mcp(e),
                 Ok(Err(e)) => {
-                    self.reset().await;
+                    self.reset(lease.id).await;
                     // An old connection may just have gone stale (session expired, server
                     // restarted): listing is idempotent, so try once more on a new one.
-                    if !fresh && attempt == 0 {
+                    if !lease.fresh && attempt == 0 {
                         continue;
                     }
                     self.convert(e)
                 }
                 Err(_) => {
-                    self.reset().await;
+                    self.reset(lease.id).await;
                     UpstreamError::Other("tools/list timed out".into())
                 }
             };
@@ -427,7 +489,11 @@ impl Upstream {
         };
         let found = cached(&self.cache.lock().unwrap());
         if let Some((tools, age)) = found {
-            if age >= self.timings.list_ttl {
+            // Not if that would start a process that was stopped for being idle: its list is
+            // fetched again whenever it starts.
+            if age >= self.timings.list_ttl
+                && (self.server.idle_timeout.is_none() || self.connected())
+            {
                 self.refresh();
             }
             return Some(tools);
@@ -462,8 +528,8 @@ impl Upstream {
         params: CallToolRequestParams,
         cancel: CancellationToken,
     ) -> Result<CallToolResponse, UpstreamError> {
-        let (client, _) = self.client().await?;
-        let call = tokio::time::timeout(CALL_TIMEOUT, client.peer().call_tool_once(params));
+        let lease = self.lease(true).await?;
+        let call = tokio::time::timeout(CALL_TIMEOUT, lease.peer.call_tool_once(params));
         tokio::select! {
             result = call => match result {
                 Ok(Ok(response)) => {
@@ -472,7 +538,7 @@ impl Upstream {
                 }
                 Ok(Err(e)) => {
                     if !matches!(e, ServiceError::McpError(_)) {
-                        self.reset().await;
+                        self.reset(lease.id).await;
                     }
                     Err(self.convert(e))
                 }
@@ -482,11 +548,54 @@ impl Upstream {
         }
     }
 
+    /// Disconnect; a command server is asked to exit, then killed if it does not.
     pub async fn close(&self) {
-        if let Some(client) = self.client.lock().await.take()
-            && let Ok(client) = Arc::try_unwrap(client)
-        {
-            let _ = client.cancel().await;
+        let conn = self.conn.lock().await.take();
+        if let Some(conn) = conn {
+            let _ = conn.service.cancel().await;
+        }
+    }
+}
+
+/// Close connection `id` of an upstream once it had no tool call for `idle`. Ends when that
+/// connection is gone, whoever closed it.
+async fn close_when_idle(upstream: Weak<Upstream>, id: u64, idle: Duration) {
+    loop {
+        let wait = {
+            let Some(upstream) = upstream.upgrade() else {
+                return;
+            };
+            if upstream.busy.load(Ordering::Acquire) > 0 {
+                idle
+            } else {
+                idle.saturating_sub(upstream.last_used.lock().unwrap().elapsed())
+            }
+        };
+        tokio::time::sleep(wait.max(Duration::from_millis(50))).await;
+        let Some(upstream) = upstream.upgrade() else {
+            return;
+        };
+        let mut slot = upstream.conn.lock().await;
+        if !slot.as_ref().is_some_and(|conn| conn.id == id) {
+            return;
+        }
+        let closed = slot.as_ref().is_some_and(|conn| conn.service.is_closed());
+        let unused = upstream.busy.load(Ordering::Acquire) == 0
+            && upstream.last_used.lock().unwrap().elapsed() >= idle;
+        if closed || unused {
+            let conn = slot.take();
+            drop(slot);
+            if let Some(conn) = conn
+                && !closed
+            {
+                tracing::info!(
+                    "[{}] not used for {}s: disconnecting",
+                    upstream.name(),
+                    idle.as_secs()
+                );
+                let _ = conn.service.cancel().await;
+            }
+            return;
         }
     }
 }
