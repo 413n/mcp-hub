@@ -253,14 +253,26 @@ impl Upstream {
         }
     }
 
-    async fn connect(&self) -> Result<Client, UpstreamError> {
+    /// Connect; for a command server, start it and say which process it is.
+    async fn connect(&self) -> Result<(Client, Option<u32>), UpstreamError> {
         match &self.server.endpoint {
-            Endpoint::Http(url) => self.connect_http(url.as_str()).await,
+            Endpoint::Http(url) => Ok((self.connect_http(url.as_str()).await?, None)),
             Endpoint::Stdio(stdio) => self.connect_stdio(stdio).await,
         }
     }
 
-    async fn connect_stdio(&self, stdio: &StdioCommand) -> Result<Client, UpstreamError> {
+    /// "stopped" or "disconnected": what a closed connection means for this kind of server.
+    fn gone(&self) -> &'static str {
+        match self.server.endpoint {
+            Endpoint::Stdio(_) => "stopped",
+            Endpoint::Http(_) => "disconnected",
+        }
+    }
+
+    async fn connect_stdio(
+        &self,
+        stdio: &StdioCommand,
+    ) -> Result<(Client, Option<u32>), UpstreamError> {
         let name = &self.server.name;
         let mut cmd = tokio::process::Command::new(&stdio.command);
         cmd.args(&stdio.args).envs(&stdio.env);
@@ -302,9 +314,10 @@ impl Upstream {
                     };
                 UpstreamError::Other(format!("cannot start {}: {e}{hint}", stdio.command))
             })?;
+        let pid = transport.id();
         let stderr = stderr.map(|s| tokio::spawn(log_stderr(name.clone(), s)));
         match self.handler().serve(transport).await {
-            Ok(client) => Ok(client),
+            Ok(client) => Ok((client, pid)),
             Err(e) => {
                 // The failed handshake dropped the transport, which kills the process; what it
                 // printed last usually says why it did not start.
@@ -396,6 +409,9 @@ impl Upstream {
         {
             return Ok(lease(conn, false));
         }
+        if slot.take().is_some() {
+            tracing::info!("[{}] {} by itself", self.name(), self.gone());
+        }
         if let Some(e) = self.failing() {
             return Err(e);
         }
@@ -403,7 +419,11 @@ impl Upstream {
             .await
             .unwrap_or_else(|_| Err(UpstreamError::Other("connection timed out".into())));
         match connected {
-            Ok(service) => {
+            Ok((service, pid)) => {
+                match pid {
+                    Some(pid) => tracing::info!("[{}] started, pid {pid}", self.name()),
+                    None => tracing::debug!("[{}] connected", self.name()),
+                }
                 let id = self.connections.fetch_add(1, Ordering::Relaxed);
                 let conn = slot.insert(Conn { id, service });
                 *self.last_used.lock().unwrap() = Instant::now();
@@ -614,7 +634,7 @@ impl Upstream {
             let answer = tokio::time::timeout(me.timings.ping_timeout, ping).await;
             // An error for an answer still shows that it is listening.
             if !matches!(answer, Ok(Ok(_) | Err(ServiceError::McpError(_)))) {
-                tracing::warn!("[{}] not responding: disconnecting", me.name());
+                tracing::warn!("[{}] {}: it no longer answers", me.name(), me.gone());
                 me.reset(id).await;
             }
         });
@@ -661,8 +681,9 @@ async fn close_when_idle(upstream: Weak<Upstream>, id: u64, idle: Duration) {
                 && !closed
             {
                 tracing::info!(
-                    "[{}] not used for {}s: disconnecting",
+                    "[{}] {}: no tool call for {}s",
                     upstream.name(),
+                    upstream.gone(),
                     idle.as_secs()
                 );
                 let _ = conn.service.cancel().await;

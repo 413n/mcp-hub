@@ -235,7 +235,8 @@ How it runs:
 - It runs in `cwd` (else the hub's directory), not in the agent's project, and
   agents' MCP roots are not forwarded. Servers meant to work on "the current
   repo" (filesystem, git) are better configured in each agent directly.
-- Its stderr goes to the hub's log, one line per message prefixed with the
+- The hub's log says when it starts (with its pid) and when and why it stops.
+  Its stderr goes there too, one line per message prefixed with the
   server name. If it fails to start, `mcp-hub status` shows the error line it
   printed last.
 - `oauth` and `bearer` do not apply; servers that need a login of their own

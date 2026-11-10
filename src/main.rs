@@ -108,9 +108,8 @@ async fn serve(config: Config, store: SecretStore) -> Result<()> {
         signal.cancel();
     });
     http::serve(listener, hub.clone(), &token, shutdown).await?;
-    for u in hub.upstreams() {
-        u.close().await;
-    }
+    // All at once: a command server gets a few seconds to exit before it is killed.
+    futures::future::join_all(hub.upstreams().iter().map(|u| u.close())).await;
     Ok(())
 }
 
