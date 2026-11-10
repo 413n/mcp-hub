@@ -29,10 +29,12 @@ if [[ -f "$HERE/mcp-hub" && -f "$HERE/systemd/mcp-hub.service.in" ]]; then
     xattr -d com.apple.quarantine "$BIN.new" 2>/dev/null || true
   fi
   mv -f "$BIN.new" "$BIN"
-  case ":$PATH:" in
-    *":$(dirname "$BIN"):"*) ;;
-    *) echo "Note: add $(dirname "$BIN") to your PATH to run 'mcp-hub' directly." ;;
-  esac
+  if [[ -z "${MCP_HUB_BIN:-}" ]]; then
+    case ":$PATH:" in
+      *":$(dirname "$BIN"):"*) ;;
+      *) echo "Note: add $(dirname "$BIN") to your PATH to run 'mcp-hub' directly." ;;
+    esac
+  fi
 else
   ROOT="$(cd "$HERE/.." && pwd)"
   command -v cargo >/dev/null || {
@@ -166,8 +168,8 @@ case "$(uname -s)" in
 esac
 
 # On macOS the hub may be waiting for a Keychain dialog (a new binary has to be allowed again).
-if ! "$BIN" check --wait 30 >/dev/null; then
-  not_running "It did not answer within 30s. On macOS, look for a Keychain dialog asking to allow mcp-hub."
+if ! why="$("$BIN" check --wait 30)"; then
+  not_running "It did not answer within 30s. $why"
 fi
 "$BIN" check
 echo "Logs: $LOGS"

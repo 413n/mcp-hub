@@ -330,16 +330,37 @@ pub async fn reload_token(port: u16, old: &str) -> anyhow::Result<Reloaded> {
     }
 }
 
-/// Whether a hub answers on `port`: it turns down a request without the token.
-pub async fn answers(port: u16) -> bool {
+/// What is on a port where a hub should be.
+#[derive(Debug, PartialEq, Eq)]
+pub enum Probe {
+    /// A hub: it turns down a request without the token.
+    Hub,
+    /// Some other program, which answered with this HTTP status.
+    Other(u16),
+    /// Something takes connections but does not answer: a hub that waits for its token.
+    Silent,
+    /// Nothing listens.
+    Nothing,
+}
+
+pub async fn probe(port: u16) -> Probe {
     let url = format!("http://127.0.0.1:{port}/mcp");
     let client = reqwest::Client::builder()
         .no_proxy()
         .timeout(Duration::from_secs(2))
         .build()
         .expect("HTTP client");
-    let res = client.get(url).send().await;
-    res.is_ok_and(|res| res.status() == StatusCode::UNAUTHORIZED)
+    match client.get(url).send().await {
+        Ok(res) if res.status() == StatusCode::UNAUTHORIZED => Probe::Hub,
+        Ok(res) => Probe::Other(res.status().as_u16()),
+        Err(e) if e.is_connect() => Probe::Nothing,
+        Err(_) => Probe::Silent,
+    }
+}
+
+/// Whether a hub answers on `port`.
+pub async fn answers(port: u16) -> bool {
+    probe(port).await == Probe::Hub
 }
 
 /// Hardcoded loopback: the bind address is deliberately not configurable.

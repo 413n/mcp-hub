@@ -827,7 +827,13 @@ async fn rotates_the_token() {
         http::Reloaded::NotRunning
     );
     assert!(http::answers(port).await);
-    assert!(!http::answers(free).await);
+    assert_eq!(http::probe(free).await, http::Probe::Nothing);
+    let other = start_fake(Fake::default()).await;
+    assert!(matches!(http::probe(other).await, http::Probe::Other(_)));
+    // Bound but not taking requests, as a hub that waits for its token.
+    let silent = http::bind(0).await.unwrap();
+    let silent_port = silent.local_addr().unwrap().port();
+    assert_eq!(http::probe(silent_port).await, http::Probe::Silent);
 }
 
 /// An agent that only tells when its tools change.

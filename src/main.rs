@@ -261,12 +261,23 @@ async fn check(options: &[String]) -> Result<bool> {
     let port = load_config()?.port;
     let deadline = std::time::Instant::now() + Duration::from_secs(wait);
     loop {
-        if http::answers(port).await {
+        let found = http::probe(port).await;
+        if found == http::Probe::Hub {
             println!("mcp-hub is running on http://127.0.0.1:{port}/mcp");
             return Ok(true);
         }
         if std::time::Instant::now() >= deadline {
-            println!("mcp-hub is not answering on 127.0.0.1:{port}");
+            match found {
+                http::Probe::Other(status) => println!(
+                    "Another program answers on 127.0.0.1:{port} (HTTP {status}), not mcp-hub: \
+                     stop it, or give the hub another \"port\" in the config."
+                ),
+                http::Probe::Silent => println!(
+                    "Something holds 127.0.0.1:{port} but does not answer: a hub that is still \
+                     starting or waits for the keyring (on macOS, look for a Keychain dialog)."
+                ),
+                _ => println!("Nothing listens on 127.0.0.1:{port}: the hub is not running."),
+            }
             return Ok(false);
         }
         tokio::time::sleep(Duration::from_secs(1)).await;

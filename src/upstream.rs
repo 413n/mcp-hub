@@ -396,6 +396,20 @@ impl Upstream {
         }
     }
 
+    fn connect_timed_out(&self) -> UpstreamError {
+        let secs = CONNECT_TIMEOUT.as_secs();
+        UpstreamError::Other(match &self.server.endpoint {
+            Endpoint::Http(_) => format!("connection timed out after {secs}s"),
+            // On macOS a server started by an updated mcp-hub may wait for the user to allow
+            // it something (files in Documents, say): macOS asks on behalf of the hub.
+            Endpoint::Stdio(_) if cfg!(target_os = "macos") => format!(
+                "started, but did not answer within {secs}s (is macOS showing a dialog asking \
+                 to allow mcp-hub access to something?)"
+            ),
+            Endpoint::Stdio(_) => format!("started, but did not answer within {secs}s"),
+        })
+    }
+
     /// "stopped" or "disconnected": what a closed connection means for this kind of server.
     fn gone(&self) -> &'static str {
         match self.server.endpoint {
@@ -555,7 +569,7 @@ impl Upstream {
         let started = Instant::now();
         let connected = tokio::time::timeout(CONNECT_TIMEOUT, self.connect())
             .await
-            .unwrap_or_else(|_| Err(UpstreamError::Other("connection timed out".into())));
+            .unwrap_or_else(|_| Err(self.connect_timed_out()));
         match connected {
             Ok((service, pid)) => {
                 match pid {
@@ -648,12 +662,18 @@ impl Upstream {
         };
         // A missing or expired login is fixed by a command, which must work at once.
         if matches!(error, UpstreamError::NeedsLogin(_)) {
+            tracing::warn!("[{}] {error}", self.name());
             return record(Duration::ZERO);
         }
         let mut failing = self.failing.lock().unwrap();
         let count = failing.as_ref().map_or(0, |f| f.count) + 1;
         let delay = self.timings.retry_delay * 2u32.saturating_pow(count - 1);
         let delay = delay.min(MAX_RETRY_DELAY);
+        tracing::warn!(
+            "[{}] {error}; next attempt in {}s at the earliest",
+            self.name(),
+            delay.as_secs()
+        );
         record(delay);
         *failing = Some(Failing {
             count,
@@ -803,8 +823,8 @@ impl Upstream {
             let done = RefreshDone(me.clone());
             loop {
                 me.refresh_again.store(false, Ordering::Release);
-                if let Err(e) = me.list_tools().await {
-                    tracing::warn!("[{}] tools/list failed: {e}", me.name());
+                // A failure is logged where it is recorded.
+                if me.list_tools().await.is_err() {
                     break;
                 }
                 if !me.refresh_again.load(Ordering::Acquire) {
