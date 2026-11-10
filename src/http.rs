@@ -3,10 +3,14 @@
 //! Checks, in order: loopback peer, exact Host (DNS rebinding), no Origin
 //! header (agents never send one; browsers always do on POST), path, token,
 //! method. Then rmcp's stateless Streamable HTTP handler takes over.
+//!
+//! One more path, [`RELOAD_PATH`], has the hub read its token from the keyring again: for
+//! `mcp-hub token --rotate`, with the token it replaces.
 
 use std::convert::Infallible;
 use std::net::SocketAddr;
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
+use std::time::Duration;
 
 use bytes::Bytes;
 use http_body_util::{BodyExt, Full, combinators::BoxBody};
@@ -22,14 +26,29 @@ use sha2::{Digest, Sha256};
 use subtle::ConstantTimeEq;
 use tokio::net::TcpListener;
 use tokio_util::sync::CancellationToken;
+use tokio_util::task::TaskTracker;
 
+use crate::TOKEN_KEY;
 use crate::hub::Hub;
+use crate::secrets::SecretStore;
 
 type Body = BoxBody<Bytes, Infallible>;
 
+/// POST here with the current token, and the hub takes the one in the keyring instead.
+pub const RELOAD_PATH: &str = "/reload-token";
+/// On every answer: changes whenever the tools the agent gets change.
+pub const TOOLS_HEADER: &str = "x-mcp-hub-tools";
+/// On an answer while some servers have yet to say what tools they have: how many.
+pub const PENDING_HEADER: &str = "x-mcp-hub-pending";
+/// How long the requests running when the hub is told to stop get to finish.
+const GRACE: Duration = Duration::from_secs(3);
+
 struct Endpoint {
     port: u16,
-    expected: [u8; 32],
+    expected: RwLock<[u8; 32]>,
+    /// Where to read the token again; `None` for a hub that never does.
+    store: Option<SecretStore>,
+    hub: Hub,
     mcp: StreamableHttpService<Hub, LocalSessionManager>,
 }
 
@@ -66,7 +85,8 @@ impl Endpoint {
         if req.headers().contains_key(header::ORIGIN) {
             return reject(StatusCode::FORBIDDEN, "browser requests are not allowed");
         }
-        if req.uri().path() != "/mcp" {
+        let reload = req.uri().path() == RELOAD_PATH && self.store.is_some();
+        if req.uri().path() != "/mcp" && !reload {
             return reject(StatusCode::NOT_FOUND, "not found");
         }
         let auth = req
@@ -74,13 +94,51 @@ impl Endpoint {
             .get(header::AUTHORIZATION)
             .map(|v| v.as_bytes())
             .unwrap_or(b"");
-        if !bool::from(digest(auth).ct_eq(&self.expected)) {
+        let expected = *self.expected.read().unwrap();
+        if !bool::from(digest(auth).ct_eq(&expected)) {
             return reject(StatusCode::UNAUTHORIZED, "unauthorized");
         }
         if req.method() != hyper::Method::POST {
             return reject(StatusCode::METHOD_NOT_ALLOWED, "method not allowed");
         }
-        self.mcp.handle(req).await
+        if reload {
+            return self.reload().await;
+        }
+        // Taken before the request is handled: a list made after it has at least these tools.
+        let (version, pending) = self.hub.tools_version(&crate::hub::skipped(req.headers()));
+        let mut res = self.mcp.handle(req).await;
+        let headers = res.headers_mut();
+        if let Ok(version) = version.parse() {
+            headers.insert(TOOLS_HEADER, version);
+        }
+        if pending > 0 {
+            headers.insert(PENDING_HEADER, pending.into());
+        }
+        res
+    }
+
+    /// Take the token in the keyring from now on.
+    async fn reload(&self) -> Response<Body> {
+        let Some(store) = &self.store else {
+            return reject(StatusCode::NOT_FOUND, "not found");
+        };
+        match store.get(TOKEN_KEY).await {
+            Ok(Some(token)) if token.len() >= 32 => {
+                *self.expected.write().unwrap() = digest(format!("Bearer {token}").as_bytes());
+                tracing::info!("took the new inbound token from the keyring");
+                let mut res = Response::new(Full::new(Bytes::new()).boxed());
+                *res.status_mut() = StatusCode::NO_CONTENT;
+                res
+            }
+            Ok(_) => reject(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "no usable token in the keyring",
+            ),
+            Err(e) => reject(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                &format!("cannot read the keyring: {e:#}"),
+            ),
+        }
     }
 }
 
@@ -91,6 +149,21 @@ pub async fn serve(
     token: &str,
     shutdown: CancellationToken,
 ) -> anyhow::Result<()> {
+    serve_with(listener, hub, token, None, shutdown).await
+}
+
+/// [`serve`], and read the token from `store` again when asked at [`RELOAD_PATH`].
+///
+/// Once `shutdown` is cancelled no new connection is taken, connections with no request
+/// running are closed, and the requests running get a few seconds to finish before they
+/// are dropped.
+pub async fn serve_with(
+    listener: TcpListener,
+    hub: Hub,
+    token: &str,
+    store: Option<SecretStore>,
+    shutdown: CancellationToken,
+) -> anyhow::Result<()> {
     anyhow::ensure!(token.len() >= 32, "inbound token missing or too short");
     let port = listener.local_addr()?.port();
     let mut config = StreamableHttpServerConfig::default();
@@ -98,14 +171,20 @@ pub async fn serve(
     config.json_response = true;
     config.sse_keep_alive = None;
     config.allowed_hosts = vec![format!("127.0.0.1:{port}"), format!("localhost:{port}")];
-    config.cancellation_token = shutdown.child_token();
+    // Not `shutdown`: the requests running then get some time to finish first.
+    let handlers = CancellationToken::new();
+    config.cancellation_token = handlers.clone();
     let config = config.enforce_origin_validation();
+    let mcp_hub = hub.clone();
     let endpoint = Arc::new(Endpoint {
         port,
-        expected: digest(format!("Bearer {token}").as_bytes()),
-        mcp: StreamableHttpService::new(move || Ok(hub.clone()), Arc::default(), config),
+        expected: RwLock::new(digest(format!("Bearer {token}").as_bytes())),
+        store,
+        hub,
+        mcp: StreamableHttpService::new(move || Ok(mcp_hub.clone()), Arc::default(), config),
     });
 
+    let connections = TaskTracker::new();
     loop {
         let (stream, peer) = tokio::select! {
             accepted = listener.accept() => match accepted {
@@ -115,22 +194,94 @@ pub async fn serve(
                     continue;
                 }
             },
-            _ = shutdown.cancelled() => return Ok(()),
+            _ = shutdown.cancelled() => break,
         };
         let endpoint = endpoint.clone();
-        tokio::spawn(async move {
+        let shutdown = shutdown.clone();
+        connections.spawn(async move {
             let service = service_fn(move |req| {
                 let endpoint = endpoint.clone();
                 async move { Ok::<_, Infallible>(endpoint.handle(req, peer).await) }
             });
-            if let Err(e) = http1::Builder::new()
-                .serve_connection(TokioIo::new(stream), service)
-                .await
-            {
+            let conn = http1::Builder::new().serve_connection(TokioIo::new(stream), service);
+            let mut conn = std::pin::pin!(conn);
+            let served = tokio::select! {
+                served = conn.as_mut() => served,
+                _ = shutdown.cancelled() => {
+                    // Closes the connection now if it is idle, else once its request is answered.
+                    conn.as_mut().graceful_shutdown();
+                    conn.await
+                }
+            };
+            if let Err(e) = served {
                 tracing::debug!("connection error: {e}");
             }
         });
     }
+    drop(listener);
+    connections.close();
+    if tokio::time::timeout(GRACE, connections.wait())
+        .await
+        .is_err()
+    {
+        tracing::info!(
+            "{} requests still running after {}s: dropping them",
+            connections.len(),
+            GRACE.as_secs()
+        );
+    }
+    handlers.cancel();
+    Ok(())
+}
+
+/// What came of asking the running hub to take the token in the keyring.
+#[derive(Debug, PartialEq, Eq)]
+pub enum Reloaded {
+    Yes,
+    /// Nothing listens on the port.
+    NotRunning,
+    /// The hub there is a version that cannot do it: it needs a restart.
+    TooOld,
+}
+
+fn local_client() -> reqwest::Client {
+    reqwest::Client::builder()
+        .no_proxy()
+        .timeout(Duration::from_secs(10))
+        .build()
+        .expect("HTTP client")
+}
+
+/// Ask the hub on `port`, which still takes `old`, to take the token in the keyring instead.
+pub async fn reload_token(port: u16, old: &str) -> anyhow::Result<Reloaded> {
+    let url = format!("http://127.0.0.1:{port}{RELOAD_PATH}");
+    let sent = local_client().post(url).bearer_auth(old).send().await;
+    let res = match sent {
+        Ok(res) => res,
+        Err(e) if e.is_connect() => return Ok(Reloaded::NotRunning),
+        Err(e) => anyhow::bail!("the hub did not answer: {e}"),
+    };
+    match res.status().as_u16() {
+        204 => Ok(Reloaded::Yes),
+        404 => Ok(Reloaded::TooOld),
+        401 => anyhow::bail!("the hub did not take the old token either"),
+        status => {
+            let text = res.text().await.unwrap_or_default();
+            anyhow::bail!("the hub answered {status}: {}", text.trim())
+        }
+    }
+}
+
+/// Whether a hub answers on `port`: it turns down a request without the token.
+pub async fn answers(port: u16) -> bool {
+    let url = format!("http://127.0.0.1:{port}/mcp");
+    let client = reqwest::Client::builder()
+        .no_proxy()
+        .timeout(Duration::from_secs(2))
+        .build()
+        .expect("HTTP client");
+    let res = client.get(url).send().await;
+    res.is_ok_and(|res| res.status() == StatusCode::UNAUTHORIZED)
 }
 
 /// Hardcoded loopback: the bind address is deliberately not configurable.

@@ -37,7 +37,7 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["fmt", "env-filter"] }
 url = "2"
 thiserror = "2"
-tokio-util = "0.7"
+tokio-util = { version = "0.7", features = ["rt"] }
 process-wrap = { version = "10", default-features = false, features = ["tokio1", "process-group"] }
 
 [target.'cfg(target_os = "linux")'.dependencies]

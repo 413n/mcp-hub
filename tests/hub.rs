@@ -84,6 +84,10 @@ impl ServerHandler for Fake {
         if req.name == "fail" {
             return Err(ErrorData::invalid_params("upstream says no", None));
         }
+        if req.name == "sleep" {
+            let ms = req.arguments.as_ref().and_then(|a| a["ms"].as_u64());
+            tokio::time::sleep(Duration::from_millis(ms.unwrap_or(0))).await;
+        }
         if req.name == "rows" {
             // A large JSON result with empty fields, as text and as structured content.
             let rows: Vec<_> = (0..300)
@@ -692,5 +696,243 @@ async fn shrinks_results() {
         json!({"n": 1, "label": "row"})
     );
     client.cancel().await.unwrap();
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+/// A hub in front of `fake`, served until the token returned is cancelled, with `store` to
+/// read its token from again.
+async fn serve_fake(
+    fake: Fake,
+    timings: Timings,
+    store: &SecretStore,
+) -> (
+    u16,
+    CancellationToken,
+    tokio::task::JoinHandle<anyhow::Result<()>>,
+) {
+    let fake_port = start_fake(fake).await;
+    let config = parse_config(
+        &json!({"servers": {"fake": {"url": format!("http://127.0.0.1:{fake_port}/mcp")}}})
+            .to_string(),
+    )
+    .unwrap();
+    let upstream = Upstream::with_timings(config.servers[0].clone(), store.clone(), timings);
+    let hub = Hub::new(vec![upstream]);
+    let listener = http::bind(0).await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let shutdown = CancellationToken::new();
+    let serving = tokio::spawn(http::serve_with(
+        listener,
+        hub,
+        TOKEN,
+        Some(store.clone()),
+        shutdown.clone(),
+    ));
+    (port, shutdown, serving)
+}
+
+async fn call_sleep(client: &reqwest::Client, port: u16, ms: u64) -> Result<String, String> {
+    let body = json!({"jsonrpc": "2.0", "id": 1, "method": "tools/call",
+        "params": {"name": "fake__sleep", "arguments": {"ms": ms}}});
+    let res = client
+        .post(format!("http://127.0.0.1:{port}/mcp"))
+        .bearer_auth(TOKEN)
+        .header("accept", "application/json, text/event-stream")
+        .json(&body)
+        .send()
+        .await
+        .map_err(|e| e.to_string())?;
+    res.text().await.map_err(|e| e.to_string())
+}
+
+/// Told to stop, the hub closes idle connections at once, lets a short call finish, and
+/// gives a long one a few seconds only.
+#[tokio::test]
+async fn stops_quickly() {
+    let store = SecretStore::memory();
+    let (port, shutdown, serving) = serve_fake(Fake::default(), Timings::default(), &store).await;
+    let client = reqwest::Client::new();
+    // A connection kept open, idle, as agents keep them.
+    assert!(
+        call_sleep(&client, port, 0)
+            .await
+            .unwrap()
+            .contains("sleep:")
+    );
+
+    let short = tokio::spawn({
+        let client = client.clone();
+        async move { call_sleep(&client, port, 1000).await }
+    });
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    let started = std::time::Instant::now();
+    shutdown.cancel();
+    serving.await.unwrap().unwrap();
+    let took = started.elapsed();
+    assert!(took < Duration::from_millis(2000), "{took:?}");
+    let answer = short.await.unwrap().unwrap();
+    assert!(answer.contains("sleep:"), "{answer}");
+    assert!(
+        reqwest::Client::new()
+            .get(format!("http://127.0.0.1:{port}/mcp"))
+            .send()
+            .await
+            .is_err()
+    );
+
+    let (port, shutdown, serving) = serve_fake(Fake::default(), Timings::default(), &store).await;
+    let long = tokio::spawn(async move { call_sleep(&reqwest::Client::new(), port, 60_000).await });
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    let started = std::time::Instant::now();
+    shutdown.cancel();
+    serving.await.unwrap().unwrap();
+    let took = started.elapsed();
+    assert!(
+        took >= Duration::from_millis(2900) && took < Duration::from_millis(4000),
+        "{took:?}"
+    );
+    long.abort();
+}
+
+/// `mcp-hub token --rotate`: once the hub is told, the old token is turned down.
+#[tokio::test]
+async fn rotates_the_token() {
+    let store = SecretStore::memory();
+    let (port, _shutdown, _serving) = serve_fake(Fake::default(), Timings::default(), &store).await;
+    let new = "the-next-token-0123456789abcdefghijklmnopqrstuvwxyz";
+    store.set(mcp_hub::TOKEN_KEY, new).await.unwrap();
+    let with = |token: &'static str| move |r: reqwest::RequestBuilder| r.bearer_auth(token);
+    // Not before it is told.
+    assert_eq!(raw(port, with(TOKEN)).await, 200);
+    assert_eq!(raw(port, with(new)).await, 401);
+    // Only with the token it has.
+    assert!(http::reload_token(port, new).await.is_err());
+    assert_eq!(
+        http::reload_token(port, TOKEN).await.unwrap(),
+        http::Reloaded::Yes
+    );
+    assert_eq!(raw(port, with(TOKEN)).await, 401);
+    assert_eq!(raw(port, with(new)).await, 200);
+    assert!(http::reload_token(port, TOKEN).await.is_err());
+
+    // A hub that cannot, and none at all.
+    let old_hub = start_hub().await;
+    assert_eq!(
+        http::reload_token(old_hub, TOKEN).await.unwrap(),
+        http::Reloaded::TooOld
+    );
+    let free = http::bind(0).await.unwrap().local_addr().unwrap().port();
+    assert_eq!(
+        http::reload_token(free, TOKEN).await.unwrap(),
+        http::Reloaded::NotRunning
+    );
+    assert!(http::answers(port).await);
+    assert!(!http::answers(free).await);
+}
+
+/// An agent that only tells when its tools change.
+#[derive(Clone)]
+struct Listener(tokio::sync::mpsc::UnboundedSender<()>);
+
+impl rmcp::ClientHandler for Listener {
+    async fn on_tool_list_changed(&self, _: rmcp::service::NotificationContext<rmcp::RoleClient>) {
+        let _ = self.0.send(());
+    }
+}
+
+/// A server slower to start than a tools/list waits for: `connect` tells the agent once
+/// its tools are there.
+#[tokio::test]
+async fn tells_the_agent_when_tools_arrive() {
+    let store = SecretStore::memory();
+    store.set(mcp_hub::TOKEN_KEY, TOKEN).await.unwrap();
+    let slow = Fake {
+        list_delay: Duration::from_millis(1000),
+        ..Fake::default()
+    };
+    let timings = Timings {
+        cold_list_wait: Duration::from_millis(200),
+        ..Timings::default()
+    };
+    let (port, _shutdown, _serving) = serve_fake(slow, timings, &store).await;
+    let (agent, bridge) = tokio::io::duplex(1 << 16);
+    let (input, output) = tokio::io::split(bridge);
+    tokio::spawn(mcp_hub::connect::run(
+        port,
+        store,
+        Vec::new(),
+        input,
+        output,
+    ));
+
+    let (told, mut changes) = tokio::sync::mpsc::unbounded_channel();
+    let client = Listener(told).serve(agent).await.unwrap();
+    let capabilities = &client.peer_info().unwrap().capabilities;
+    assert_eq!(
+        capabilities.tools.as_ref().unwrap().list_changed,
+        Some(true)
+    );
+    assert_eq!(client.list_all_tools().await.unwrap().len(), 0);
+    tokio::time::timeout(Duration::from_secs(5), changes.recv())
+        .await
+        .expect("no tools/list_changed")
+        .unwrap();
+    assert_eq!(client.list_all_tools().await.unwrap().len(), 1);
+    // Nothing more changes, nothing more is said.
+    let more = tokio::time::timeout(Duration::from_millis(2500), changes.recv()).await;
+    assert!(more.is_err(), "{more:?}");
+    client.cancel().await.unwrap();
+}
+
+/// A restarted hub lists the tools saved by the one before at once, and fetches them again.
+#[tokio::test]
+async fn remembers_tool_lists() {
+    let dir = std::env::temp_dir().join(format!("mcp-hub-tools-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    let fake = Fake {
+        list_delay: Duration::from_millis(500),
+        ..Fake::default()
+    };
+    let lists = fake.lists.clone();
+    let fake_port = start_fake(fake).await;
+    let server = |max_description: usize| {
+        let config = parse_config(
+            &json!({"servers": {"fake": {
+                "url": format!("http://127.0.0.1:{fake_port}/mcp"),
+                "maxDescription": max_description,
+            }}})
+            .to_string(),
+        )
+        .unwrap();
+        let timings = Timings {
+            cold_list_wait: Duration::from_millis(100),
+            ..Timings::default()
+        };
+        Upstream::with_timings(config.servers[0].clone(), SecretStore::memory(), timings)
+    };
+
+    let first = server(2000);
+    first.keep_tools_in(&dir);
+    assert!(first.pending());
+    assert_eq!(first.list_tools().await.unwrap().len(), 2);
+    assert!(dir.join("fake.json").exists());
+
+    let restarted = server(2000);
+    restarted.keep_tools_in(&dir);
+    assert!(!restarted.pending());
+    let generation = restarted.tools_generation();
+    let started = std::time::Instant::now();
+    assert_eq!(restarted.tools().await.unwrap().len(), 1);
+    assert!(started.elapsed() < Duration::from_millis(100));
+    // And asks the server again, in the background; the same tools change nothing.
+    tokio::time::sleep(Duration::from_millis(800)).await;
+    assert_eq!(lists.load(Ordering::SeqCst), 2);
+    assert_eq!(restarted.tools_generation(), generation);
+
+    // Another config: the saved list does not apply.
+    let other = server(500);
+    other.keep_tools_in(&dir);
+    assert!(other.pending());
+    assert!(other.tools().await.is_none());
     std::fs::remove_dir_all(&dir).unwrap();
 }

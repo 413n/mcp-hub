@@ -45,13 +45,9 @@ impl Client {
             return Self::default();
         };
         let header = |name| http.headers.get(name).and_then(|value| value.to_str().ok());
-        let names = header(SKIP_HEADER).unwrap_or_default().split(',');
         let name = header(CLIENT_HEADER).or_else(|| header("user-agent"));
         Self {
-            skip: names
-                .map(|name| name.trim().to_owned())
-                .filter(|name| !name.is_empty())
-                .collect(),
+            skip: skipped(&http.headers),
             name: name.map(|name| name.chars().take(80).collect()),
         }
     }
@@ -66,6 +62,14 @@ impl Client {
     }
 }
 
+/// The servers an agent asks to leave out, from its request's headers.
+pub fn skipped(headers: &hyper::HeaderMap) -> Vec<String> {
+    let value = headers.get(SKIP_HEADER).and_then(|v| v.to_str().ok());
+    let names = value.unwrap_or_default().split(',');
+    let names = names.map(|name| name.trim().to_owned());
+    names.filter(|name| !name.is_empty()).collect()
+}
+
 /// What Claude, Codex and Cursor accept as a tool name.
 fn usable_tool_name(name: &str) -> bool {
     (1..=64).contains(&name.len())
@@ -76,6 +80,9 @@ fn usable_tool_name(name: &str) -> bool {
 
 /// The hub's own tool: the descriptions it cut short, in full. Listed while there are any.
 pub const DESCRIBE: &str = "hub__describe";
+
+/// In a tools/list result's `_meta`: the version of the list (see [`Hub::tools_version`]).
+pub const TOOLS_META: &str = "dev.mcp-hub/tools";
 
 /// `text` cut to about `max` characters, where a paragraph or a line ends if one does
 /// nearby, with a note saying where the rest is. `None` if it is short enough as it is.
@@ -209,6 +216,8 @@ pub struct Hub {
     stats: Stats,
     /// Where results too large to pass on whole are kept for the agent to read.
     results: Arc<PathBuf>,
+    /// Tells this hub from one that ran before it, in [`Hub::tools_version`].
+    started: u128,
 }
 
 /// How much a tool call returned, for the record: characters of text, and bytes of
@@ -242,7 +251,29 @@ impl Hub {
             upstreams: Arc::new(upstreams),
             stats,
             results: Arc::new(crate::stats::state_dir().join("results")),
+            started: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |d| d.as_nanos()),
         }
+    }
+
+    /// For an agent that leaves out the servers in `skip`: something that changes whenever
+    /// the tools it gets change, and how many servers have yet to say what tools they have.
+    pub fn tools_version(&self, skip: &[String]) -> (String, usize) {
+        let listed = self
+            .upstreams
+            .iter()
+            .filter(|u| !skip.iter().any(|s| s == u.name()));
+        let (mut changes, mut pending) = (0u64, 0);
+        for upstream in listed {
+            changes = changes.wrapping_add(upstream.tools_generation());
+            pending += usize::from(upstream.pending());
+        }
+        (self.version(changes), pending)
+    }
+
+    fn version(&self, changes: u64) -> String {
+        format!("{:x}-{changes}", self.started)
     }
 
     /// Keep results too large to pass on whole in `dir` instead of the usual place.
@@ -300,22 +331,25 @@ impl Hub {
 
     /// Every upstream's tools, from each one's cached list: see [`Upstream::tools`].
     pub async fn list_tools(&self) -> Vec<Tool> {
-        self.tools_for(&Client::default()).await
+        self.tools_for(&Client::default()).await.0
     }
 
-    async fn tools_for(&self, client: &Client) -> Vec<Tool> {
+    /// The tools `client` gets, and their version (see [`Hub::tools_version`]).
+    async fn tools_for(&self, client: &Client) -> (Vec<Tool>, String) {
         let upstreams = self.upstreams.iter().filter(|u| !client.skips(u));
-        let lists = futures::future::join_all(upstreams.map(|u| u.tools())).await;
-        let mut tools =
-            Vec::with_capacity(lists.iter().flatten().map(|l| l.len()).sum::<usize>() + 1);
-        for list in lists.into_iter().flatten() {
-            tools.extend(list.iter().cloned());
+        let lists = futures::future::join_all(upstreams.map(|u| u.tools_as_of())).await;
+        let count = lists.iter().map(|(l, _)| l.as_ref().map_or(0, |l| l.len()));
+        let mut tools = Vec::with_capacity(count.sum::<usize>() + 1);
+        let mut changes = 0u64;
+        for (list, generation) in lists {
+            changes = changes.wrapping_add(generation);
+            tools.extend(list.iter().flat_map(|list| list.iter().cloned()));
         }
         let mut listing = self.upstreams.iter().filter(|u| !client.skips(u));
         if listing.any(|u| u.cuts_descriptions()) {
             tools.push(describe_tool());
         }
-        tools
+        (tools, self.version(changes))
     }
 
     /// Answer a call of [`DESCRIBE`]: what was cut from the tool named in `arguments`.
@@ -397,7 +431,7 @@ impl ServerHandler for Hub {
         context: RequestContext<RoleServer>,
     ) -> Result<ListToolsResult, ErrorData> {
         let (client, started) = (Client::of(&context), Instant::now());
-        let tools = self.tools_for(&client).await;
+        let (tools, version) = self.tools_for(&client).await;
         self.stats.record(
             "list",
             json!({
@@ -407,7 +441,11 @@ impl ServerHandler for Hub {
                 "tools": tools.len(),
             }),
         );
-        Ok(ListToolsResult::with_all_items(tools))
+        let mut result = ListToolsResult::with_all_items(tools);
+        // Exactly the version of this list, for `mcp-hub connect`; the header may be older.
+        let meta = serde_json::Map::from_iter([(TOOLS_META.to_owned(), version.into())]);
+        result.meta = Some(rmcp::model::MetaObject(meta));
+        Ok(result)
     }
 
     async fn call_tool(

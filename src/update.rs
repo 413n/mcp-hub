@@ -107,9 +107,30 @@ async fn run_installer(version: &str) -> Result<()> {
         .write_all(&script)?;
     let status = child.wait()?;
     if !status.success() {
-        bail!("installer failed ({status})");
+        // It may have failed after it replaced the binary and stopped the hub.
+        let running = match crate::config::load_config() {
+            Ok(config) => crate::http::answers(config.port).await,
+            Err(_) => false,
+        };
+        if running {
+            bail!("installer failed ({status}); the hub is still running");
+        }
+        bail!(
+            "installer failed ({status}), and the hub is not running. Start it with:\n  {}",
+            start_command()
+        );
     }
     Ok(())
+}
+
+/// The command that (re)starts the service the installer set up.
+pub fn start_command() -> &'static str {
+    if cfg!(target_os = "macos") {
+        "launchctl kickstart -k gui/$(id -u)/dev.mcp-hub || \
+         launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/dev.mcp-hub.plist"
+    } else {
+        "systemctl --user restart mcp-hub"
+    }
 }
 
 /// `target`: a specific version to install (also older ones), or None for the latest.

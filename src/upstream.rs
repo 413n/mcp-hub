@@ -3,7 +3,8 @@
 //! An HTTP upstream is reached over streamable HTTP. A command upstream is a child
 //! process speaking MCP over stdin/stdout; "reconnecting" starts a new process.
 
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
+use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, LazyLock, Weak};
@@ -22,6 +23,7 @@ use rmcp::{
         streamable_http_client::StreamableHttpClientTransportConfig,
     },
 };
+use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::ChildStderr;
 use tokio::sync::{Mutex, watch};
@@ -39,6 +41,10 @@ const LIST_TIMEOUT: Duration = Duration::from_secs(60);
 const STDERR_TAIL: usize = 20;
 /// The longest an upstream that keeps failing is left alone between attempts.
 const MAX_RETRY_DELAY: Duration = Duration::from_secs(300);
+/// How long [`Upstream::close`] waits for a connection to close before what is left of it is
+/// killed. rmcp's own way can take several seconds: a command server gets 3 to exit once its
+/// stdin is closed and 3 more after SIGTERM, an HTTP session 5 to be deleted.
+const CLOSE_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// The hub as an upstream's MCP client: it only listens for the tools changing.
 struct Handler {
@@ -76,7 +82,17 @@ impl Conn {
     /// SIGTERM, then SIGKILL, a few seconds apart), and then whatever is left of its process
     /// group is killed: a server that exits at once may leave behind what it started.
     async fn close(self) {
-        let _ = self.service.cancel().await;
+        self.close_within(None).await
+    }
+
+    /// [`Conn::close`], but kill what is left after `limit`.
+    async fn close_within(self, limit: Option<Duration>) {
+        let closing = self.service.cancel();
+        match limit {
+            // A close cut short goes on in the background; the kill below ends it.
+            Some(limit) => drop(tokio::time::timeout(limit, closing).await),
+            None => drop(closing.await),
+        }
         if let Some(pid) = self.pid.filter(|pid| *pid > 1) {
             // SAFETY: this only sends a signal. The group is the server's own, never the
             // hub's: the server was started as the leader of a new one.
@@ -199,8 +215,21 @@ impl Default for Timings {
 struct CachedTools {
     tools: Arc<Vec<Tool>>,
     /// The descriptions the hub cut, in full: see [`crate::hub::Listed`].
-    full: Arc<std::collections::HashMap<String, Vec<(String, String)>>>,
+    full: Arc<HashMap<String, Vec<(String, String)>>>,
     fetched: Instant,
+    /// Read from the file an earlier run saved it to, and not fetched since.
+    saved: bool,
+    /// [`Upstream::tools_generation`] when this list was cached.
+    generation: u64,
+}
+
+/// An upstream's tools as saved on disk, for a restarted hub to list them at once.
+#[derive(Serialize, Deserialize)]
+struct SavedTools {
+    /// What the list depends on: when it changes, the saved list is not used.
+    fingerprint: String,
+    tools: Vec<Tool>,
+    full: HashMap<String, Vec<(String, String)>>,
 }
 
 /// An upstream that failed, and until when it is not tried again.
@@ -232,6 +261,10 @@ pub struct Upstream {
     refreshed: watch::Sender<u64>,
     /// The tools changed while a refresh was running: it has to fetch them once more.
     refresh_again: AtomicBool,
+    /// Goes up every time the cached list changes.
+    generation: AtomicU64,
+    /// The file the tool list is saved to, if it is.
+    saved_in: std::sync::OnceLock<PathBuf>,
 }
 
 /// Marks the background refresh as over, also if it panicked.
@@ -275,7 +308,74 @@ impl Upstream {
             refreshing: AtomicBool::new(false),
             refreshed: watch::channel(0).0,
             refresh_again: AtomicBool::new(false),
+            generation: AtomicU64::new(0),
+            saved_in: std::sync::OnceLock::new(),
         })
+    }
+
+    /// Save the tool list in `dir` whenever it changes, and start from the one an earlier run
+    /// saved there: a restarted hub then lists every server's tools at once, without waiting
+    /// for the slow ones. A saved list is fetched again when it is first asked for (for a
+    /// server stopped for being idle, when it next starts).
+    pub fn keep_tools_in(&self, dir: &Path) {
+        let path = dir.join(format!("{}.json", self.name()));
+        let saved = std::fs::read_to_string(&path).ok();
+        let saved = saved.and_then(|text| serde_json::from_str::<SavedTools>(&text).ok());
+        if let Some(saved) = saved.filter(|saved| saved.fingerprint == self.fingerprint()) {
+            let generation = self.generation.fetch_add(1, Ordering::AcqRel) + 1;
+            *self.cache.lock().unwrap() = Some(CachedTools {
+                tools: Arc::new(saved.tools),
+                full: Arc::new(saved.full),
+                fetched: Instant::now(),
+                saved: true,
+                generation,
+            });
+        }
+        let _ = self.saved_in.set(path);
+    }
+
+    /// What the tools the hub lists for this server depend on, apart from the server itself.
+    fn fingerprint(&self) -> String {
+        let s = &self.server;
+        let about = format!(
+            "{} {:?} {:?} {:?}",
+            env!("CARGO_PKG_VERSION"),
+            s.endpoint,
+            s.auth,
+            s.max_description
+        );
+        let digest = <sha2::Sha256 as sha2::Digest>::digest(about.as_bytes());
+        digest.iter().map(|b| format!("{b:02x}")).collect()
+    }
+
+    fn save_tools(&self, cached: &CachedTools) {
+        let Some(path) = self.saved_in.get() else {
+            return;
+        };
+        let saved = SavedTools {
+            fingerprint: self.fingerprint(),
+            tools: cached.tools.to_vec(),
+            full: (*cached.full).clone(),
+        };
+        let write = || -> std::io::Result<()> {
+            crate::stats::private_dir(path.parent().unwrap_or(Path::new(".")))?;
+            let temporary = path.with_extension("json.new");
+            std::fs::write(&temporary, serde_json::to_vec(&saved)?)?;
+            std::fs::rename(&temporary, path)
+        };
+        if let Err(e) = write() {
+            tracing::debug!("[{}] cannot save the tool list: {e}", self.name());
+        }
+    }
+
+    /// Goes up every time the tools this server has change, also when they first arrive.
+    pub fn tools_generation(&self) -> u64 {
+        self.generation.load(Ordering::Acquire)
+    }
+
+    /// The server's tools are not known yet, and no attempt to fetch them has ended.
+    pub fn pending(&self) -> bool {
+        self.cache.lock().unwrap().is_none() && *self.refreshed.borrow() == 0
     }
 
     pub fn name(&self) -> &str {
@@ -601,11 +701,24 @@ impl Upstream {
                             "toolsCut": (!listed.full.is_empty()).then_some(listed.full.len()),
                         }),
                     );
-                    *self.cache.lock().unwrap() = Some(CachedTools {
+                    let mut cached = CachedTools {
                         tools: Arc::new(listed.tools),
                         full: Arc::new(listed.full),
                         fetched: Instant::now(),
-                    });
+                        saved: false,
+                        generation: 0,
+                    };
+                    let mut cache = self.cache.lock().unwrap();
+                    let changed = cache
+                        .as_ref()
+                        .is_none_or(|old| old.tools != cached.tools || old.full != cached.full);
+                    cached.generation = if changed {
+                        self.save_tools(&cached);
+                        self.generation.fetch_add(1, Ordering::AcqRel) + 1
+                    } else {
+                        self.generation.load(Ordering::Acquire)
+                    };
+                    *cache = Some(cached);
                     return Ok(tools);
                 }
                 Ok(Err(ServiceError::McpError(e))) => UpstreamError::Mcp(e),
@@ -635,29 +748,35 @@ impl Upstream {
     /// with nothing cached does this wait for the upstream, and not for long: `None` means it
     /// did not answer in time (its tools appear once it has) or it failed.
     pub async fn tools(&self) -> Option<Arc<Vec<Tool>>> {
-        let cached = |cache: &Option<CachedTools>| {
-            cache
-                .as_ref()
-                .map(|c| (c.tools.clone(), c.fetched.elapsed()))
+        self.tools_as_of().await.0
+    }
+
+    /// [`Upstream::tools`], and the [`Upstream::tools_generation`] of what it returns.
+    pub async fn tools_as_of(&self) -> (Option<Arc<Vec<Tool>>>, u64) {
+        let cached = |cache: &Option<CachedTools>| match cache {
+            Some(c) => {
+                let old = c.saved || c.fetched.elapsed() >= self.timings.list_ttl;
+                (Some(c.tools.clone()), c.generation, old)
+            }
+            None => (None, self.tools_generation(), false),
         };
-        let found = cached(&self.cache.lock().unwrap());
-        if let Some((tools, age)) = found {
+        let (found, generation, old) = cached(&self.cache.lock().unwrap());
+        if let Some(tools) = found {
             // Not if that would start a process that was stopped for being idle: its list is
             // fetched again whenever it starts.
-            if age >= self.timings.list_ttl
-                && (self.server.idle_timeout.is_none() || self.connected())
-            {
+            if old && (self.server.idle_timeout.is_none() || self.connected()) {
                 self.refresh();
             }
-            return Some(tools);
+            return (Some(tools), generation);
         }
         if self.failing().is_some() {
-            return None;
+            return (None, generation);
         }
         let mut done = self.refreshed.subscribe();
         self.refresh();
         let _ = tokio::time::timeout(self.timings.cold_list_wait, done.changed()).await;
-        cached(&self.cache.lock().unwrap()).map(|(tools, _)| tools)
+        let (tools, generation, _) = cached(&self.cache.lock().unwrap());
+        (tools, generation)
     }
 
     /// Whether the cached list has descriptions the hub cut short.
@@ -758,7 +877,7 @@ impl Upstream {
         let conn = self.conn.lock().await.take();
         if let Some(conn) = conn {
             self.stopped(&conn, "shutdown");
-            conn.close().await;
+            conn.close_within(Some(CLOSE_TIMEOUT)).await;
         }
     }
 }

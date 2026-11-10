@@ -33,9 +33,10 @@ fn usage() -> String {
   stats [--days N] [--all] [--json]
                       what the hub did lately: calls, failures, result and definition sizes
   token               print the inbound bearer token, creating it if needed
-  token --rotate      replace the inbound token (then restart the hub)
+  token --rotate      replace the inbound token; the running hub turns the old one down at once
   connect             for an agent's config: MCP on stdin/stdout, forwarded to the running hub
   headers             for an agent's config: print the HTTP headers to send to the hub, as JSON
+  check [--wait N]    whether the hub answers on its port, waiting up to N seconds for it
   update              update to the latest release (installs made by install.sh)
   update --check      only check whether a newer release exists
   update <version>    install that version (also to go back)
@@ -86,9 +87,12 @@ async fn serve(config: Config, store: SecretStore) -> Result<()> {
         serde_json::json!({"version": env!("CARGO_PKG_VERSION"), "servers": config.servers.len()}),
     );
     let servers = config.servers.iter();
-    let upstreams = servers
+    let upstreams: Vec<_> = servers
         .map(|s| Upstream::with(s.clone(), store.clone(), Timings::default(), stats.clone()))
         .collect();
+    for upstream in &upstreams {
+        upstream.keep_tools_in(&stats::state_dir().join("tools"));
+    }
     let hub = Hub::with_stats(upstreams, stats);
     mcp_hub::results::sweep(&stats::state_dir().join("results"));
     let names: Vec<_> = hub
@@ -122,9 +126,10 @@ async fn serve(config: Config, store: SecretStore) -> Result<()> {
         let _ = tokio::signal::ctrl_c().await;
         signal.cancel();
     });
-    http::serve(listener, hub.clone(), &token, shutdown).await?;
-    // All at once: a command server gets a few seconds to exit before it is killed.
+    http::serve_with(listener, hub.clone(), &token, Some(store), shutdown).await?;
+    // All at once: a command server gets a moment to exit before it is killed.
     futures::future::join_all(hub.upstreams().iter().map(|u| u.close())).await;
+    tracing::info!("mcp-hub stopped");
     Ok(())
 }
 
@@ -172,11 +177,9 @@ async fn show_stats(config: Config, store: SecretStore, options: &[String]) -> R
 }
 
 async fn token(store: SecretStore, rotate: bool) -> Result<()> {
-    let existing = if rotate {
-        None
-    } else {
-        store.get(TOKEN_KEY).await?
-    };
+    let existing = store.get(TOKEN_KEY).await?;
+    let old = if rotate { existing.clone() } else { None };
+    let existing = existing.filter(|_| !rotate);
     let value = match existing {
         Some(v) => v,
         None => {
@@ -188,8 +191,53 @@ async fn token(store: SecretStore, rotate: bool) -> Result<()> {
             v
         }
     };
+    // The running hub still takes the old token: have it read the new one.
+    if let Some(old) = old {
+        let told = match load_config() {
+            Ok(config) => http::reload_token(config.port, &old).await,
+            Err(e) => Err(e),
+        };
+        match told {
+            Ok(http::Reloaded::Yes) => {
+                eprintln!("The running hub takes only the new token from now on.")
+            }
+            Ok(http::Reloaded::NotRunning) => {}
+            Ok(http::Reloaded::TooOld) => eprintln!(
+                "The running hub is an older version and still takes the old token: \
+                 restart it with {}",
+                update::start_command()
+            ),
+            Err(e) => eprintln!(
+                "mcp-hub: could not hand the new token to the running hub ({e:#}). \
+                 Restart it with {}",
+                update::start_command()
+            ),
+        }
+    }
     println!("{value}");
     Ok(())
+}
+
+/// `mcp-hub check`: whether the hub answers, for scripts.
+async fn check(options: &[String]) -> Result<bool> {
+    let wait = match options {
+        [] => 0,
+        [flag, n] if flag == "--wait" => n.parse().context("usage: mcp-hub check [--wait N]")?,
+        _ => bail!("usage: mcp-hub check [--wait N]"),
+    };
+    let port = load_config()?.port;
+    let deadline = std::time::Instant::now() + Duration::from_secs(wait);
+    loop {
+        if http::answers(port).await {
+            println!("mcp-hub is running on http://127.0.0.1:{port}/mcp");
+            return Ok(true);
+        }
+        if std::time::Instant::now() >= deadline {
+            println!("mcp-hub is not answering on 127.0.0.1:{port}");
+            return Ok(false);
+        }
+        tokio::time::sleep(Duration::from_secs(1)).await;
+    }
 }
 
 /// Read a secret: hidden prompt on a terminal, otherwise the piped input.
@@ -283,6 +331,14 @@ async fn run(args: &[String]) -> Result<ExitCode> {
     {
         set_token(load_config()?, store, name, Some(var)).await?;
         return Ok(ExitCode::SUCCESS);
+    }
+    if args.first().map(String::as_str) == Some("check") {
+        let running = check(&args[1..]).await?;
+        return Ok(if running {
+            ExitCode::SUCCESS
+        } else {
+            ExitCode::FAILURE
+        });
     }
     if args.first().map(String::as_str) == Some("stats") {
         show_stats(load_config()?, store, &args[1..]).await?;
@@ -391,7 +447,10 @@ fn main() -> ExitCode {
         runtime
     };
     let runtime = runtime.enable_all().build().expect("tokio runtime");
-    match runtime.block_on(run(&args)) {
+    let result = runtime.block_on(run(&args));
+    // Not to wait on a task that is stuck, such as a keychain read waiting for a dialog.
+    runtime.shutdown_timeout(Duration::from_secs(1));
+    match result {
         Ok(code) => code,
         Err(e) => {
             eprintln!("mcp-hub: {e:#}");
