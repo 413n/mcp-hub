@@ -1,6 +1,7 @@
 //! Command (stdio) upstreams: a real child process speaking MCP over stdin/stdout.
 
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use mcp_hub::{
     config::parse_config,
@@ -17,7 +18,7 @@ fn fixtures() -> PathBuf {
         .join("fixtures")
 }
 
-fn upstream(server: serde_json::Value, store: &SecretStore) -> Upstream {
+fn upstream(server: serde_json::Value, store: &SecretStore) -> Arc<Upstream> {
     let config = parse_config(&json!({"servers": {"local": server}}).to_string()).unwrap();
     Upstream::new(config.servers[0].clone(), store.clone())
 }

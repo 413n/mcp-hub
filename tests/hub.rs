@@ -1,8 +1,16 @@
 //! End to end: a fake upstream MCP server, the hub in front of it, and real MCP clients.
 
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::time::Duration;
 
-use mcp_hub::{config::parse_config, http, hub::Hub, secrets::SecretStore, upstream::Upstream};
+use mcp_hub::{
+    config::parse_config,
+    http,
+    hub::Hub,
+    secrets::SecretStore,
+    upstream::{Timings, Upstream},
+};
 use rmcp::{
     ErrorData, RoleServer, ServerHandler, ServiceExt,
     model::{
@@ -21,8 +29,12 @@ use tokio_util::sync::CancellationToken;
 const TOKEN: &str = "test-token-0123456789abcdefghijklmnopqrstuvwxyz";
 
 /// Stands in for a real upstream: one tool that echoes, one with an unusable name.
-#[derive(Clone)]
-struct Fake;
+#[derive(Clone, Default)]
+struct Fake {
+    /// How many tools/list requests it got.
+    lists: Arc<AtomicUsize>,
+    list_delay: Duration,
+}
 
 impl ServerHandler for Fake {
     fn get_info(&self) -> ServerConfig {
@@ -34,6 +46,8 @@ impl ServerHandler for Fake {
         _: Option<PaginatedRequestParams>,
         _: RequestContext<RoleServer>,
     ) -> Result<ListToolsResult, ErrorData> {
+        self.lists.fetch_add(1, Ordering::SeqCst);
+        tokio::time::sleep(self.list_delay).await;
         let tools = ["echo", "bad.name"].map(|name| {
             serde_json::from_value(json!({"name": name, "inputSchema": {"type": "object"}}))
                 .unwrap()
@@ -57,7 +71,7 @@ impl ServerHandler for Fake {
     }
 }
 
-async fn start_fake() -> u16 {
+async fn start_fake(fake: Fake) -> u16 {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let port = listener.local_addr().unwrap().port();
     let mut config = StreamableHttpServerConfig::default();
@@ -67,7 +81,7 @@ async fn start_fake() -> u16 {
     let service = Arc::new(StreamableHttpService::<
         Fake,
         rmcp::transport::streamable_http_server::session::local::LocalSessionManager,
-    >::new(|| Ok(Fake), Arc::default(), config));
+    >::new(move || Ok(fake.clone()), Arc::default(), config));
     tokio::spawn(async move {
         loop {
             let (stream, _) = listener.accept().await.unwrap();
@@ -87,7 +101,7 @@ async fn start_fake() -> u16 {
 }
 
 async fn start_hub() -> u16 {
-    let fake_port = start_fake().await;
+    let fake_port = start_fake(Fake::default()).await;
     let config = parse_config(
         &json!({"servers": {
             "fake": {"url": format!("http://127.0.0.1:{fake_port}/mcp"), "description": "Echoes things back"},
@@ -227,4 +241,63 @@ async fn proxies_tools() {
     assert!(text.contains("mcp-hub login sentry"), "{text}");
 
     client.cancel().await.unwrap();
+}
+
+#[tokio::test]
+async fn caches_tool_lists() {
+    let fast = Fake::default();
+    let slow = Fake {
+        list_delay: Duration::from_millis(800),
+        ..Fake::default()
+    };
+    let config = parse_config(
+        &json!({"servers": {
+            "fast": {"url": format!("http://127.0.0.1:{}/mcp", start_fake(fast.clone()).await)},
+            "slow": {"url": format!("http://127.0.0.1:{}/mcp", start_fake(slow.clone()).await)},
+        }})
+        .to_string(),
+    )
+    .unwrap();
+    let timings = Timings {
+        list_ttl: Duration::from_millis(1500),
+        cold_list_wait: Duration::from_millis(300),
+    };
+    let store = SecretStore::memory();
+    let hub = Hub::new(
+        config
+            .servers
+            .iter()
+            .map(|s| Upstream::with_timings(s.clone(), store.clone(), timings.clone()))
+            .collect(),
+    );
+    let names = |tools: Vec<rmcp::model::Tool>| {
+        tools.iter().map(|t| t.name.to_string()).collect::<Vec<_>>()
+    };
+    let counts = || {
+        (
+            fast.lists.load(Ordering::SeqCst),
+            slow.lists.load(Ordering::SeqCst),
+        )
+    };
+
+    // Many agents at once: each upstream is asked once, and the slow one is not waited for.
+    let lists = futures::future::join_all((0..20).map(|_| hub.list_tools())).await;
+    for list in lists {
+        assert_eq!(names(list), ["fast__echo"]);
+    }
+    assert_eq!(counts(), (1, 1));
+
+    // The slow one has answered meanwhile, and nothing is asked again.
+    tokio::time::sleep(Duration::from_millis(1000)).await;
+    assert_eq!(names(hub.list_tools().await), ["fast__echo", "slow__echo"]);
+    assert_eq!(counts(), (1, 1));
+
+    // Past the TTL the old list is served at once, slow upstream included, and refreshed once.
+    tokio::time::sleep(Duration::from_millis(1200)).await;
+    let started = std::time::Instant::now();
+    let lists = futures::future::join_all((0..20).map(|_| hub.list_tools())).await;
+    assert!(started.elapsed() < Duration::from_millis(500));
+    assert_eq!(names(lists[0].clone()), ["fast__echo", "slow__echo"]);
+    tokio::time::sleep(Duration::from_millis(1200)).await;
+    assert_eq!(counts(), (2, 2));
 }

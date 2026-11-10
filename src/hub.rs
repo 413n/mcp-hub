@@ -6,7 +6,7 @@ use rmcp::{
     ErrorData, RoleServer, ServerHandler,
     model::{
         CallToolRequestParams, CallToolResponse, CallToolResult, ContentBlock, Implementation,
-        ListToolsResult, PaginatedRequestParams, ServerCapabilities, ServerConfig,
+        ListToolsResult, PaginatedRequestParams, ServerCapabilities, ServerConfig, Tool,
     },
     service::RequestContext,
 };
@@ -23,15 +23,34 @@ fn usable_tool_name(name: &str) -> bool {
             .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
 }
 
+/// An upstream's tools under their hub names, without those whose name agents would reject.
+pub(crate) fn hub_tools(server: &str, tools: &[Tool]) -> Vec<Tool> {
+    let mut renamed = Vec::with_capacity(tools.len());
+    for tool in tools {
+        let name = format!("{server}{SEP}{}", tool.name);
+        if !usable_tool_name(&name) {
+            tracing::warn!(
+                "[{server}] skipping tool with unusable name: {:?}",
+                tool.name
+            );
+            continue;
+        }
+        let mut tool = tool.clone();
+        tool.name = name.into();
+        renamed.push(tool);
+    }
+    renamed
+}
+
 #[derive(Clone)]
 pub struct Hub {
     upstreams: Arc<Vec<Arc<Upstream>>>,
 }
 
 impl Hub {
-    pub fn new(upstreams: Vec<Upstream>) -> Self {
+    pub fn new(upstreams: Vec<Arc<Upstream>>) -> Self {
         Self {
-            upstreams: Arc::new(upstreams.into_iter().map(Arc::new).collect()),
+            upstreams: Arc::new(upstreams),
         }
     }
 
@@ -54,33 +73,12 @@ impl Hub {
         text
     }
 
-    pub async fn list_tools(&self) -> Vec<rmcp::model::Tool> {
-        let results = futures::future::join_all(
-            self.upstreams
-                .iter()
-                .map(|u| async move { (u, u.list_tools().await) }),
-        )
-        .await;
-        let mut tools = Vec::new();
-        for (u, result) in results {
-            match result {
-                Ok(list) => {
-                    for mut tool in list {
-                        let name = format!("{}{SEP}{}", u.name(), tool.name);
-                        if !usable_tool_name(&name) {
-                            tracing::warn!(
-                                "[{}] skipping tool with unusable name: {:?}",
-                                u.name(),
-                                tool.name
-                            );
-                            continue;
-                        }
-                        tool.name = name.into();
-                        tools.push(tool);
-                    }
-                }
-                Err(e) => tracing::warn!("[{}] tools/list failed: {e}", u.name()),
-            }
+    /// Every upstream's tools, from each one's cached list: see [`Upstream::tools`].
+    pub async fn list_tools(&self) -> Vec<Tool> {
+        let lists = futures::future::join_all(self.upstreams.iter().map(|u| u.tools())).await;
+        let mut tools = Vec::with_capacity(lists.iter().flatten().map(|l| l.len()).sum());
+        for list in lists.into_iter().flatten() {
+            tools.extend(list.iter().cloned());
         }
         tools
     }

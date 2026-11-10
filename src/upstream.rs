@@ -5,8 +5,9 @@
 
 use std::collections::VecDeque;
 use std::process::Stdio;
-use std::sync::Arc;
-use std::time::Duration;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Weak};
+use std::time::{Duration, Instant};
 
 use rmcp::{
     RoleClient, ServiceError, ServiceExt,
@@ -23,10 +24,11 @@ use rmcp::{
 };
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::ChildStderr;
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, watch};
 use tokio_util::sync::CancellationToken;
 
 use crate::config::{Auth, Endpoint, ServerConfig, StdioCommand};
+use crate::hub::hub_tools;
 use crate::oauth::{KeyringCredentialStore, secret_env_key};
 use crate::secrets::SecretStore;
 
@@ -57,19 +59,70 @@ pub fn client_info() -> ClientConfig {
     )
 }
 
+/// Timing knobs. Fixed in production; tests shorten them.
+#[derive(Debug, Clone)]
+pub struct Timings {
+    /// A cached tool list is served as it is for this long, then refreshed in the background.
+    pub list_ttl: Duration,
+    /// How long a tools/list waits for an upstream whose tools are not cached yet.
+    pub cold_list_wait: Duration,
+}
+
+impl Default for Timings {
+    fn default() -> Self {
+        Self {
+            list_ttl: Duration::from_secs(300),
+            cold_list_wait: Duration::from_secs(5),
+        }
+    }
+}
+
+/// An upstream's tools under their hub names, as last fetched.
+struct CachedTools {
+    tools: Arc<Vec<Tool>>,
+    fetched: Instant,
+}
+
 pub struct Upstream {
     pub server: ServerConfig,
     store: SecretStore,
+    timings: Timings,
+    /// For the background tasks, which must not keep a dropped upstream alive.
+    me: Weak<Upstream>,
     client: Mutex<Option<Arc<Client>>>,
+    cache: std::sync::Mutex<Option<CachedTools>>,
+    /// Set while a background refresh of `cache` runs, so that there is only one.
+    refreshing: AtomicBool,
+    /// Bumped when a background refresh ends, whatever its outcome.
+    refreshed: watch::Sender<u64>,
+}
+
+/// Marks the background refresh as over, also if it panicked.
+struct RefreshDone(Arc<Upstream>);
+
+impl Drop for RefreshDone {
+    fn drop(&mut self) {
+        self.0.refreshing.store(false, Ordering::Release);
+        self.0.refreshed.send_modify(|n| *n = n.wrapping_add(1));
+    }
 }
 
 impl Upstream {
-    pub fn new(server: ServerConfig, store: SecretStore) -> Self {
-        Self {
+    pub fn new(server: ServerConfig, store: SecretStore) -> Arc<Self> {
+        Self::with_timings(server, store, Timings::default())
+    }
+
+    pub fn with_timings(server: ServerConfig, store: SecretStore, timings: Timings) -> Arc<Self> {
+        Arc::new_cyclic(|me| Self {
             server,
             store,
+            timings,
+            me: me.clone(),
             client: Mutex::new(None),
-        }
+            cache: std::sync::Mutex::new(None),
+            refreshing: AtomicBool::new(false),
+            refreshed: watch::channel(0).0,
+        })
     }
 
     pub fn name(&self) -> &str {
@@ -225,13 +278,20 @@ impl Upstream {
         }
     }
 
+    /// Ask the upstream for its tools, under their own names. Also updates the cached list.
     pub async fn list_tools(&self) -> Result<Vec<Tool>, UpstreamError> {
         // Listing is idempotent, so retry once on a fresh connection.
         for attempt in 0..2 {
             let client = self.client().await?;
             let result = tokio::time::timeout(LIST_TIMEOUT, client.list_all_tools()).await;
             match result {
-                Ok(Ok(tools)) => return Ok(tools),
+                Ok(Ok(tools)) => {
+                    *self.cache.lock().unwrap() = Some(CachedTools {
+                        tools: Arc::new(hub_tools(self.name(), &tools)),
+                        fetched: Instant::now(),
+                    });
+                    return Ok(tools);
+                }
                 Ok(Err(ServiceError::McpError(e))) => return Err(UpstreamError::Mcp(e)),
                 Ok(Err(e)) => {
                     self.reset().await;
@@ -246,6 +306,44 @@ impl Upstream {
             }
         }
         unreachable!()
+    }
+
+    /// The tools under their hub names, for the hub's own tools/list, from the cache.
+    ///
+    /// An old list is still returned, and refreshed in the background for the next caller. Only
+    /// with nothing cached does this wait for the upstream, and not for long: `None` means it
+    /// did not answer in time (its tools appear once it has) or it failed.
+    pub async fn tools(&self) -> Option<Arc<Vec<Tool>>> {
+        let cached = |cache: &Option<CachedTools>| {
+            cache
+                .as_ref()
+                .map(|c| (c.tools.clone(), c.fetched.elapsed()))
+        };
+        let found = cached(&self.cache.lock().unwrap());
+        if let Some((tools, age)) = found {
+            if age >= self.timings.list_ttl {
+                self.refresh();
+            }
+            return Some(tools);
+        }
+        let mut done = self.refreshed.subscribe();
+        self.refresh();
+        let _ = tokio::time::timeout(self.timings.cold_list_wait, done.changed()).await;
+        cached(&self.cache.lock().unwrap()).map(|(tools, _)| tools)
+    }
+
+    /// Fetch the tool list in the background, unless that is already happening.
+    fn refresh(&self) {
+        let Some(me) = self.me.upgrade() else { return };
+        if self.refreshing.swap(true, Ordering::AcqRel) {
+            return;
+        }
+        tokio::spawn(async move {
+            let done = RefreshDone(me);
+            if let Err(e) = done.0.list_tools().await {
+                tracing::warn!("[{}] tools/list failed: {e}", done.0.name());
+            }
+        });
     }
 
     /// Forward a tools/call. Results pass through unchanged; never retried, as it may have side effects.

@@ -1,5 +1,6 @@
 use std::io::{IsTerminal, Read};
 use std::process::ExitCode;
+use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
@@ -40,7 +41,7 @@ config: {}",
     )
 }
 
-fn upstreams(config: &Config, store: &SecretStore) -> Vec<Upstream> {
+fn upstreams(config: &Config, store: &SecretStore) -> Vec<Arc<Upstream>> {
     config
         .servers
         .iter()
