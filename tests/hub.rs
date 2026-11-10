@@ -34,6 +34,16 @@ struct Fake {
     /// How many tools/list requests it got.
     lists: Arc<AtomicUsize>,
     list_delay: Duration,
+    /// Also list "wordy", a tool that says far too much about itself.
+    wordy: bool,
+}
+
+/// What "wordy" has to say: `about` it, over and over, and how it ends.
+fn wordy_text(about: &str) -> String {
+    format!(
+        "{}\n\nThe end of {about}.",
+        format!("All about {about}. ").repeat(60)
+    )
 }
 
 impl ServerHandler for Fake {
@@ -52,7 +62,18 @@ impl ServerHandler for Fake {
             serde_json::from_value(json!({"name": name, "inputSchema": {"type": "object"}}))
                 .unwrap()
         });
-        Ok(ListToolsResult::with_all_items(tools.to_vec()))
+        let mut tools = tools.to_vec();
+        if self.wordy {
+            let wordy = json!({
+                "name": "wordy",
+                "description": wordy_text("the tool"),
+                "inputSchema": {"type": "object", "properties": {
+                    "command": {"type": "string", "description": wordy_text("the command")},
+                }},
+            });
+            tools.push(serde_json::from_value(wordy).unwrap());
+        }
+        Ok(ListToolsResult::with_all_items(tools))
     }
 
     async fn call_tool(
@@ -479,4 +500,104 @@ async fn records_what_happens() {
         "{record}"
     );
     std::fs::remove_dir_all(&dir).unwrap();
+}
+
+/// Long descriptions are cut where the hub lists the tools, and `hub__describe` has the rest.
+#[tokio::test]
+async fn cuts_long_descriptions() {
+    let wordy = Fake {
+        wordy: true,
+        ..Fake::default()
+    };
+    let config = parse_config(
+        &json!({"maxDescription": 300, "servers": {
+            "fake": {"url": format!("http://127.0.0.1:{}/mcp", start_fake(wordy).await)},
+            "whole": {
+                "url": format!("http://127.0.0.1:{}/mcp", start_fake(Fake { wordy: true, ..Fake::default() }).await),
+                "maxDescription": 0,
+            },
+        }})
+        .to_string(),
+    )
+    .unwrap();
+    let store = SecretStore::memory();
+    store.set(mcp_hub::TOKEN_KEY, TOKEN).await.unwrap();
+    let upstreams = config
+        .servers
+        .iter()
+        .map(|s| Upstream::new(s.clone(), store.clone()));
+    let hub = Hub::new(upstreams.collect());
+    let listener = http::bind(0).await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    tokio::spawn(async move { http::serve(listener, hub, TOKEN, CancellationToken::new()).await });
+    let (agent, bridge) = tokio::io::duplex(1 << 16);
+    let (input, output) = tokio::io::split(bridge);
+    tokio::spawn(mcp_hub::connect::run(
+        port,
+        store,
+        Vec::new(),
+        input,
+        output,
+    ));
+    let client = mcp_hub::upstream::client_info().serve(agent).await.unwrap();
+
+    let tools = client.list_all_tools().await.unwrap();
+    let names: Vec<_> = tools.iter().map(|t| t.name.as_ref()).collect();
+    assert_eq!(
+        names,
+        [
+            "fake__echo",
+            "fake__wordy",
+            "whole__echo",
+            "whole__wordy",
+            "hub__describe"
+        ]
+    );
+    let description = tools[1].description.as_deref().unwrap();
+    assert!(
+        description.starts_with("All about the tool."),
+        "{description}"
+    );
+    assert!(
+        description.len() < 500 && !description.contains("The end"),
+        "{description}"
+    );
+    assert!(description.contains(r#"call hub__describe with {"tool": "fake__wordy"}"#));
+    let parameter = tools[1].input_schema["properties"]["command"]["description"].as_str();
+    assert!(
+        parameter.is_some_and(|p| p.len() < 500 && !p.contains("The end")),
+        "{parameter:?}"
+    );
+    // The server that asked to be left alone is.
+    assert_eq!(
+        tools[3].description.as_deref(),
+        Some(wordy_text("the tool").as_str())
+    );
+
+    let describe = |tool: &'static str| {
+        let mut params = CallToolRequestParams::new("hub__describe");
+        params.arguments = Some(json!({"tool": tool}).as_object().unwrap().clone());
+        let client = &client;
+        async move {
+            let result = client.call_tool(params).await.unwrap();
+            result.content[0].as_text().unwrap().text.clone()
+        }
+    };
+    // By the name an agent knows the tool under, prefix and all.
+    let full = describe("mcp__hub__fake__wordy").await;
+    assert!(
+        full.contains(&format!("## Description\n\n{}", wordy_text("the tool"))),
+        "{full}"
+    );
+    assert!(
+        full.contains(&format!(
+            "## Parameter command\n\n{}",
+            wordy_text("the command")
+        )),
+        "{full}"
+    );
+    assert!(describe("fake__echo").await.contains("Nothing was cut"));
+    assert!(describe("whole__wordy").await.contains("Nothing was cut"));
+    assert!(describe("nope").await.contains("No tool named"));
+    client.cancel().await.unwrap();
 }

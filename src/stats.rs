@@ -192,6 +192,8 @@ pub fn summary(dir: &Path, days: u64, tools: Option<&[Value]>) -> Value {
     let mut by_agent: BTreeMap<String, (Calls, u64)> = BTreeMap::new();
     let mut servers: BTreeMap<String, Map<String, Value>> = BTreeMap::new();
     let mut errors: BTreeMap<(String, String), u64> = BTreeMap::new();
+    // Per server, as of its last tool list: tools with a description cut, and bytes saved.
+    let mut cuts: BTreeMap<String, (u64, u64)> = BTreeMap::new();
     let mut count = |server: &Value, what: &str| {
         let server = servers.entry(server.as_str().unwrap_or("?").to_owned());
         let n = server.or_default().entry(what).or_insert(json!(0));
@@ -209,6 +211,12 @@ pub fn summary(dir: &Path, days: u64, tools: Option<&[Value]>) -> Value {
                 by_agent.entry(agent(e)).or_default().0.add(e);
             }
             "list" => by_agent.entry(agent(e)).or_default().1 += 1,
+            "tools" => {
+                let saved = e["bytesBeforeCuts"].as_u64().unwrap_or(0);
+                let saved = saved.saturating_sub(e["bytes"].as_u64().unwrap_or(0));
+                let cut = (e["toolsCut"].as_u64().unwrap_or(0), saved);
+                cuts.insert(e["server"].as_str().unwrap_or("?").to_owned(), cut);
+            }
             "connect" => count(&e["server"], "connected"),
             "fail" => count(&e["server"], "failed"),
             "stop" => count(&e["server"], e["why"].as_str().unwrap_or("stopped")),
@@ -241,6 +249,10 @@ pub fn summary(dir: &Path, days: u64, tools: Option<&[Value]>) -> Value {
             json!({"agent": name, "calls": calls.ms.len(), "failed": calls.failed, "toolLists": lists})
         }).collect::<Vec<_>>(),
         "servers": servers,
+        "descriptionsCut": {
+            "tools": cuts.values().map(|(tools, _)| tools).sum::<u64>(),
+            "bytesSaved": cuts.values().map(|(_, saved)| saved).sum::<u64>(),
+        },
         "errors": errors.iter().take(15).map(|((tool, error), n)| {
             json!({"tool": tool, "error": error, "times": n})
         }).collect::<Vec<_>>(),
@@ -387,6 +399,15 @@ pub fn render(s: &Value, all: bool) -> String {
                 short(&server["bytes"])
             );
         }
+        let cut = &s["descriptionsCut"];
+        if n(&cut["tools"]) > 0 {
+            let _ = writeln!(
+                out,
+                "Descriptions cut short in {} tools, which saves {} bytes (hub__describe has them in full)",
+                n(&cut["tools"]),
+                short(&cut["bytesSaved"]),
+            );
+        }
         let _ = writeln!(out, "Largest:");
         for tool in list(&d["largest"]) {
             let name = tool["tool"].as_str().unwrap_or("?");
@@ -456,6 +477,8 @@ mod tests {
         stats.record("call", call("b", 5, "failed", 40));
         stats.record("list", json!({"client": "codex/1", "skip": ["t3code"]}));
         stats.record("stop", json!({"server": "s", "why": "idle"}));
+        let listed = json!({"server": "s", "bytes": 900, "bytesBeforeCuts": 5000, "toolsCut": 2});
+        stats.record("tools", listed);
         Stats::off().record("call", call("c", 1, "ok", 1));
 
         let tools = [json!({"name": "s__a"}), json!({"name": "s__z"})];
@@ -469,6 +492,10 @@ mod tests {
         assert_eq!(s["agents"][1]["agent"], "codex (without t3code)");
         assert_eq!(s["agents"][1]["toolLists"], 1);
         assert_eq!(s["servers"]["s"]["idle"], 1);
+        assert_eq!(
+            s["descriptionsCut"],
+            json!({"tools": 2, "bytesSaved": 4100})
+        );
         assert_eq!(s["definitions"]["neverCalled"], json!(["s__z"]));
         let text = render(&s, false);
         assert!(text.contains("3 tool calls (1 failed)"), "{text}");

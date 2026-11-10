@@ -30,7 +30,14 @@ pub struct ServerConfig {
     /// An environment variable: agents started with it set do not get this server. For a
     /// server that an application also gives its own agents directly.
     pub skip_when_env: Option<String>,
+    /// Descriptions of this server's tools and their parameters are cut to about this many
+    /// characters. `None` leaves them as they are.
+    pub max_description: Option<usize>,
 }
+
+/// Unless `maxDescription` says otherwise. Few descriptions are longer; one that is can
+/// cost an agent thousands of tokens each time it loads the tool.
+const DEFAULT_MAX_DESCRIPTION: usize = 2000;
 
 /// A command server nobody has called for this long is stopped, unless `idleTimeout` says otherwise.
 const DEFAULT_IDLE_TIMEOUT: Duration = Duration::from_secs(600);
@@ -100,6 +107,8 @@ pub fn load_config() -> Result<Config> {
 struct RawConfig {
     port: Option<u16>,
     login_port: Option<u16>,
+    /// Characters; 0 for no limit. Each server can set its own.
+    max_description: Option<usize>,
     #[serde(default)]
     servers: serde_json::Map<String, serde_json::Value>,
 }
@@ -120,6 +129,7 @@ struct RawServer {
     /// Seconds; 0 for never.
     idle_timeout: Option<u64>,
     skip_when_env: Option<String>,
+    max_description: Option<usize>,
     description: Option<String>,
     oauth: Option<RawOAuth>,
     bearer: Option<bool>,
@@ -139,9 +149,11 @@ fn check_port(port: u16, what: &str) -> Result<u16> {
     Ok(port)
 }
 
-/// No underscores, so "<server>__<tool>" always splits unambiguously.
+/// No underscores, so "<server>__<tool>" always splits unambiguously. "hub" is the hub's
+/// own: see [`crate::hub::DESCRIBE`].
 fn valid_server_name(name: &str) -> bool {
-    (1..=24).contains(&name.len())
+    name != "hub"
+        && (1..=24).contains(&name.len())
         && name
             .bytes()
             .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
@@ -217,11 +229,18 @@ pub fn parse_config(text: &str) -> Result<Config> {
         bail!("port and loginPort must differ");
     }
 
+    // Shorter than this and little of a description would be left to go by.
+    let max_description = |at: &str, max: Option<usize>| match max {
+        Some(1..200) => bail!("{at}maxDescription: expected 0 (no limit) or at least 200"),
+        max => Ok(max),
+    };
+    let default_max = max_description("", raw.max_description)?;
+
     let mut servers = Vec::new();
     for (name, value) in raw.servers {
         let at = format!("servers.{name}");
         if !valid_server_name(&name) {
-            bail!("{at}: name must be 1-24 characters of a-z, 0-9 and -");
+            bail!("{at}: name must be 1-24 characters of a-z, 0-9 and -, and not \"hub\"");
         }
         let mut s: RawServer = serde_json::from_value(value).with_context(|| at.clone())?;
         if let Some(d) = &s.description
@@ -230,6 +249,9 @@ pub fn parse_config(text: &str) -> Result<Config> {
             bail!("{at}.description: expected a string of at most 300 characters");
         }
         let description = s.description.take();
+        let max = max_description(&format!("{at}."), s.max_description.take())?;
+        let max_description = Some(max.or(default_max).unwrap_or(DEFAULT_MAX_DESCRIPTION));
+        let max_description = max_description.filter(|max| *max > 0);
         let skip_when_env = s.skip_when_env.take();
         if let Some(var) = &skip_when_env
             && !valid_secret_env_name(var)
@@ -292,6 +314,7 @@ pub fn parse_config(text: &str) -> Result<Config> {
             auth,
             idle_timeout,
             skip_when_env,
+            max_description,
         });
     }
     Ok(Config {
@@ -371,6 +394,21 @@ mod tests {
             c.servers.iter().map(|s| s.idle_timeout).collect::<Vec<_>>(),
             [secs(600), secs(30), None, None, secs(120)]
         );
+    }
+
+    #[test]
+    fn max_description() {
+        let c = parse_config(
+            r#"{"maxDescription":500,"servers":{
+                "a":{"url":"https://a/"},"b":{"url":"https://b/","maxDescription":0},
+                "c":{"url":"https://c/","maxDescription":9000}
+            }}"#,
+        )
+        .unwrap();
+        let max: Vec<_> = c.servers.iter().map(|s| s.max_description).collect();
+        assert_eq!(max, [Some(500), None, Some(9000)]);
+        let c = parse_config(r#"{"servers":{"a":{"url":"https://a/"}}}"#).unwrap();
+        assert_eq!(c.servers[0].max_description, Some(DEFAULT_MAX_DESCRIPTION));
     }
 
     #[test]
@@ -483,6 +521,18 @@ mod tests {
             (
                 r#"{"servers":{"a":{"url":"https://x/","skipWhenEnv":"A B"}}}"#,
                 "skipWhenEnv not a variable name",
+            ),
+            (
+                r#"{"servers":{"a":{"url":"https://x/","maxDescription":50}}}"#,
+                "maxDescription too short to be of use",
+            ),
+            (
+                r#"{"maxDescription":-1,"servers":{}}"#,
+                "negative maxDescription",
+            ),
+            (
+                r#"{"servers":{"hub":{"url":"https://x/"}}}"#,
+                "the hub's own name",
             ),
             (r#"{"port":3050,"loginPort":3050}"#, "same ports"),
             (r#"{"port":80}"#, "privileged port"),

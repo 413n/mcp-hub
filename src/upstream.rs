@@ -198,6 +198,8 @@ impl Default for Timings {
 /// An upstream's tools under their hub names, as last fetched.
 struct CachedTools {
     tools: Arc<Vec<Tool>>,
+    /// The descriptions the hub cut, in full: see [`crate::hub::Listed`].
+    full: Arc<std::collections::HashMap<String, Vec<(String, String)>>>,
     fetched: Instant,
 }
 
@@ -585,18 +587,23 @@ impl Upstream {
             let error = match listing {
                 Ok(Ok(tools)) => {
                     self.succeeded();
-                    let listed = hub_tools(self.name(), &tools);
+                    let listed = hub_tools(self.name(), &tools, self.server.max_description);
+                    let size =
+                        |tools: &[Tool]| serde_json::to_vec(tools).map_or(0, |json| json.len());
                     self.stats.record(
                         "tools",
                         serde_json::json!({
                             "server": self.name(),
                             "ms": started.elapsed().as_millis() as u64,
-                            "tools": listed.len(),
-                            "bytes": serde_json::to_vec(&listed).map_or(0, |json| json.len()),
+                            "tools": listed.tools.len(),
+                            "bytes": size(&listed.tools),
+                            "bytesBeforeCuts": (!listed.full.is_empty()).then(|| size(&tools)),
+                            "toolsCut": (!listed.full.is_empty()).then_some(listed.full.len()),
                         }),
                     );
                     *self.cache.lock().unwrap() = Some(CachedTools {
-                        tools: Arc::new(listed),
+                        tools: Arc::new(listed.tools),
+                        full: Arc::new(listed.full),
                         fetched: Instant::now(),
                     });
                     return Ok(tools);
@@ -651,6 +658,19 @@ impl Upstream {
         self.refresh();
         let _ = tokio::time::timeout(self.timings.cold_list_wait, done.changed()).await;
         cached(&self.cache.lock().unwrap()).map(|(tools, _)| tools)
+    }
+
+    /// Whether the cached list has descriptions the hub cut short.
+    pub fn cuts_descriptions(&self) -> bool {
+        let cache = self.cache.lock().unwrap();
+        cache.as_ref().is_some_and(|c| !c.full.is_empty())
+    }
+
+    /// What was cut from the tool listed as `hub_name`: each description in full, the
+    /// tool's own under "" and a parameter's under its name.
+    pub fn full_descriptions(&self, hub_name: &str) -> Option<Vec<(String, String)>> {
+        let cache = self.cache.lock().unwrap();
+        cache.as_ref()?.full.get(hub_name).cloned()
     }
 
     /// Fetch the tool list in the background, unless that is already happening or the

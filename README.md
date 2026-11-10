@@ -181,6 +181,9 @@ stdio server, see [Local (stdio) servers](#local-stdio-servers)).
   that long without a tool call (the next call opens a new one). Off by default:
   an open session costs the hub nothing. See [Local (stdio) servers](#local-stdio-servers),
   where it matters.
+- `maxDescription`: optional, in characters, default 2000; `0` for no limit.
+  See [Long descriptions](#long-descriptions). Also accepted at the top level of
+  the config, next to `port`, as the default for every server.
 - `skipWhenEnv`: optional, the name of an environment variable. An agent started
   with that variable set does not get this server: it is not in its tool list
   or in the instructions, and a call to it is refused with a note. For a server
@@ -208,6 +211,26 @@ is also refreshed when a server announces that its tools changed
 (`notifications/tools/list_changed`) and whenever a local server starts. Only
 right after the hub starts are the upstreams asked directly, each for at most
 5 seconds; a slower one is left out of that first list and appears in the next.
+
+### Long descriptions
+
+An agent that loads a tool takes in its whole description and those of its
+parameters, each time. Most are a few hundred characters; some servers put a
+manual in one (a single tool of 40,000 characters costs about 10,000 tokens per
+load). The hub cuts any description longer than `maxDescription` characters
+where a paragraph or line ends, and appends a note saying how much is missing
+and how to get it:
+
+    [mcp-hub cut the rest, 37512 more characters. To read all of it, call
+    hub__describe with {"tool": "posthog__exec"}.]
+
+`hub__describe` is a tool of the hub's own, listed whenever something was cut.
+It returns the cut descriptions of that tool in full, so nothing is lost: an
+agent that needs the detail asks for it once, and the others never carry it.
+Every tool stays listed under its name, and what a tool does comes first in its
+description, so finding the right tool works as before. `mcp-hub stats` says how
+many tools were cut and what that saves; set `"maxDescription": 0` on a server
+whose tools work worse for it.
 
 ### Local (stdio) servers
 

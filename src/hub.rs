@@ -1,5 +1,6 @@
 //! Merges the tools of several upstreams under "<server>__<tool>" names.
 
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -12,7 +13,7 @@ use rmcp::{
     },
     service::RequestContext,
 };
-use serde_json::json;
+use serde_json::{Value, json};
 
 use crate::stats::Stats;
 use crate::upstream::{Upstream, UpstreamError};
@@ -72,9 +73,83 @@ fn usable_tool_name(name: &str) -> bool {
             .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
 }
 
-/// An upstream's tools under their hub names, without those whose name agents would reject.
-pub(crate) fn hub_tools(server: &str, tools: &[Tool]) -> Vec<Tool> {
-    let mut renamed = Vec::with_capacity(tools.len());
+/// The hub's own tool: the descriptions it cut short, in full. Listed while there are any.
+pub const DESCRIBE: &str = "hub__describe";
+
+/// `text` cut to about `max` characters, where a paragraph or a line ends if one does
+/// nearby, with a note saying where the rest is. `None` if it is short enough as it is.
+fn cut(text: &str, max: usize, tool: &str) -> Option<String> {
+    // The note takes room too: something only just too long is better left whole.
+    let (end, _) = text.char_indices().nth(max + max / 10)?;
+    let (end, _) = text[..end].char_indices().nth(max)?;
+    let head = &text[..end];
+    let at = ["\n\n", "\n", " "].iter().find_map(|sep| {
+        let at = head.rfind(sep)?;
+        (at >= end / 2).then_some(at)
+    });
+    let head = head[..at.unwrap_or(end)].trim_end();
+    let rest = text[head.len()..].chars().count();
+    Some(format!(
+        "{head}\n\n[mcp-hub cut the rest, {rest} more characters. To read all of it, \
+         call {DESCRIBE} with {{\"tool\": \"{tool}\"}}.]"
+    ))
+}
+
+/// Cut every description in a tool's input schema, noting in `full` what each was, under
+/// the parameter it belongs to.
+fn cut_schema(
+    schema: &mut Value,
+    path: &mut Vec<String>,
+    max: usize,
+    tool: &str,
+    full: &mut Vec<(String, String)>,
+) {
+    match schema {
+        Value::Object(members) => {
+            for (key, value) in members.iter_mut() {
+                if key == "description"
+                    && let Value::String(text) = value
+                {
+                    if let Some(short) = cut(text, max, tool) {
+                        full.push((path.join("."), std::mem::replace(text, short)));
+                    }
+                    continue;
+                }
+                // The words of JSON Schema itself say nothing about where this is.
+                let named = !matches!(key.as_str(), "properties" | "items" | "$defs");
+                if named {
+                    path.push(key.clone());
+                }
+                cut_schema(value, path, max, tool, full);
+                if named {
+                    path.pop();
+                }
+            }
+        }
+        Value::Array(items) => {
+            for item in items {
+                cut_schema(item, path, max, tool, full);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// An upstream's tools as the hub lists them.
+pub(crate) struct Listed {
+    pub tools: Vec<Tool>,
+    /// By hub name, the descriptions that were cut, in full: the tool's own under "",
+    /// a parameter's under its name.
+    pub full: HashMap<String, Vec<(String, String)>>,
+}
+
+/// An upstream's tools under their hub names, without those whose name agents would reject,
+/// and with descriptions cut to `max_description` characters.
+pub(crate) fn hub_tools(server: &str, tools: &[Tool], max_description: Option<usize>) -> Listed {
+    let mut listed = Listed {
+        tools: Vec::with_capacity(tools.len()),
+        full: HashMap::new(),
+    };
     for tool in tools {
         let name = format!("{server}{SEP}{}", tool.name);
         if !usable_tool_name(&name) {
@@ -85,10 +160,46 @@ pub(crate) fn hub_tools(server: &str, tools: &[Tool]) -> Vec<Tool> {
             continue;
         }
         let mut tool = tool.clone();
+        if let Some(max) = max_description {
+            let mut full = Vec::new();
+            if let Some(text) = &mut tool.description
+                && let Some(short) = cut(text, max, &name)
+            {
+                full.push((String::new(), std::mem::replace(text, short.into()).into()));
+            }
+            let mut schema = Value::Object((*tool.input_schema).clone());
+            cut_schema(&mut schema, &mut Vec::new(), max, &name, &mut full);
+            if let Value::Object(schema) = schema
+                && full.iter().any(|(parameter, _)| !parameter.is_empty())
+            {
+                tool.input_schema = Arc::new(schema);
+            }
+            if !full.is_empty() {
+                listed.full.insert(name.clone(), full);
+            }
+        }
         tool.name = name.into();
-        renamed.push(tool);
+        listed.tools.push(tool);
     }
-    renamed
+    listed
+}
+
+/// The definition of [`DESCRIBE`].
+fn describe_tool() -> Tool {
+    serde_json::from_value(json!({
+        "name": DESCRIBE,
+        "description": "Show in full the description of a tool, or of its parameters, \
+            that mcp-hub cut short. Such a description ends with a note naming this tool.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "tool": {"type": "string", "description": "The tool's name, as in the note."}
+            },
+            "required": ["tool"]
+        },
+        "annotations": {"readOnlyHint": true}
+    }))
+    .expect("a valid tool")
 }
 
 #[derive(Clone)]
@@ -161,11 +272,53 @@ impl Hub {
     async fn tools_for(&self, client: &Client) -> Vec<Tool> {
         let upstreams = self.upstreams.iter().filter(|u| !client.skips(u));
         let lists = futures::future::join_all(upstreams.map(|u| u.tools())).await;
-        let mut tools = Vec::with_capacity(lists.iter().flatten().map(|l| l.len()).sum());
+        let mut tools =
+            Vec::with_capacity(lists.iter().flatten().map(|l| l.len()).sum::<usize>() + 1);
         for list in lists.into_iter().flatten() {
             tools.extend(list.iter().cloned());
         }
+        let mut listing = self.upstreams.iter().filter(|u| !client.skips(u));
+        if listing.any(|u| u.cuts_descriptions()) {
+            tools.push(describe_tool());
+        }
         tools
+    }
+
+    /// Answer a call of [`DESCRIBE`]: what was cut from the tool named in `arguments`.
+    async fn describe(
+        &self,
+        client: &Client,
+        arguments: Option<&rmcp::model::JsonObject>,
+    ) -> String {
+        let asked = arguments
+            .and_then(|a| a.get("tool"))
+            .and_then(Value::as_str);
+        let asked = asked.unwrap_or_default().trim();
+        // Agents put a prefix of their own before the hub's names ("mcp__hub__").
+        let found = self.upstreams.iter().find_map(|u| {
+            let at = asked.find(&format!("{}{SEP}", u.name()))?;
+            (at == 0 || asked[..at].ends_with(SEP)).then_some((u, &asked[at..]))
+        });
+        let Some((upstream, name)) = found.filter(|(u, _)| !client.skips(u)) else {
+            return format!(
+                "No tool named \"{asked}\". Give the name as in the note, like \"server{SEP}tool\"."
+            );
+        };
+        upstream.tools().await;
+        let Some(full) = upstream.full_descriptions(name) else {
+            return format!(
+                "Nothing was cut from {name}: what its definition says is all there is."
+            );
+        };
+        let mut text = format!("{name}, in full where mcp-hub had cut it.");
+        for (parameter, description) in full {
+            let title = match parameter.as_str() {
+                "" => "Description".to_owned(),
+                parameter => format!("Parameter {parameter}"),
+            };
+            text.push_str(&format!("\n\n## {title}\n\n{description}"));
+        }
+        text
     }
 
     fn route(&self, name: &str) -> Option<(&Arc<Upstream>, String)> {
@@ -229,6 +382,24 @@ impl ServerHandler for Hub {
         context: RequestContext<RoleServer>,
     ) -> Result<CallToolResponse, ErrorData> {
         let full_name = request.name.to_string();
+        if full_name == DESCRIBE {
+            let (client, started) = (Client::of(&context), Instant::now());
+            let text = self.describe(&client, request.arguments.as_ref()).await;
+            self.stats.record(
+                "call",
+                json!({
+                    "server": "hub",
+                    "tool": "describe",
+                    "client": client.name,
+                    "skip": client.skipped(),
+                    "ms": started.elapsed().as_millis() as u64,
+                    "outcome": "ok",
+                    "text": text.chars().count(),
+                }),
+            );
+            let result = CallToolResult::success(vec![ContentBlock::text(text)]);
+            return Ok(CallToolResponse::Complete(result));
+        }
         let Some((upstream, tool)) = self.route(&full_name) else {
             return Err(ErrorData::invalid_params(
                 format!("Unknown tool: {full_name}"),
@@ -286,12 +457,88 @@ impl ServerHandler for Hub {
 
 #[cfg(test)]
 mod tests {
-    use super::usable_tool_name;
+    use super::*;
 
     #[test]
     fn tool_names() {
         assert!(usable_tool_name("sentry__search_issues"));
         assert!(!usable_tool_name("x__bad.name"));
         assert!(!usable_tool_name(&"a".repeat(65)));
+    }
+
+    #[test]
+    fn cuts_long_descriptions() {
+        assert_eq!(cut(&"word ".repeat(40), 200, "s__t"), None);
+        // Only just too long: the note would take the room that cutting saves.
+        assert_eq!(cut(&"word ".repeat(43), 200, "s__t"), None);
+
+        let text = format!(
+            "{}\n\n{}",
+            "first ".repeat(25).trim(),
+            "second ".repeat(100)
+        );
+        let short = cut(&text, 200, "s__t").unwrap();
+        let (head, note) = short.split_once("\n\n[").unwrap();
+        assert_eq!(head, "first ".repeat(25).trim());
+        assert!(
+            note.contains(r#"call hub__describe with {"tool": "s__t"}"#),
+            "{note}"
+        );
+        assert!(
+            note.contains(&format!("{} more characters", text.len() - head.len())),
+            "{note}"
+        );
+
+        // No paragraph or line to end at, and characters of several bytes.
+        let short = cut(&"é".repeat(1000), 200, "s__t").unwrap();
+        assert!(short.starts_with(&"é".repeat(200)) && !short.starts_with(&"é".repeat(201)));
+    }
+
+    #[test]
+    fn cuts_tool_and_parameter_descriptions() {
+        let long = "x ".repeat(400);
+        let tool: Tool = serde_json::from_value(json!({
+            "name": "t",
+            "description": long,
+            "inputSchema": {"type": "object", "properties": {
+                "command": {"type": "string", "description": long},
+                "description": {"type": "string", "description": "short"},
+                "nested": {"type": "object", "properties": {"deep": {"description": long}}},
+            }},
+        }))
+        .unwrap();
+        let plain: Tool =
+            serde_json::from_value(json!({"name": "p", "inputSchema": {"type": "object"}}))
+                .unwrap();
+        let all = [tool.clone(), plain.clone()];
+
+        let listed = hub_tools("s", &all, Some(200));
+        let parts: Vec<_> = listed.full["s__t"]
+            .iter()
+            .map(|(p, _)| p.as_str())
+            .collect();
+        assert_eq!(parts, ["", "command", "nested.deep"]);
+        assert!(listed.full["s__t"].iter().all(|(_, text)| *text == long));
+        let cut_tool = &listed.tools[0];
+        assert!(cut_tool.description.as_ref().unwrap().len() < 400);
+        let schema = Value::Object((*cut_tool.input_schema).clone());
+        assert!(
+            schema["properties"]["command"]["description"]
+                .as_str()
+                .unwrap()
+                .len()
+                < 400
+        );
+        assert_eq!(schema["properties"]["description"]["description"], "short");
+        // A tool with nothing to cut is passed on as it came.
+        assert!(!listed.full.contains_key("s__p"));
+        assert!(Arc::ptr_eq(
+            &listed.tools[1].input_schema,
+            &plain.input_schema
+        ));
+
+        let listed = hub_tools("s", &all, None);
+        assert!(listed.full.is_empty());
+        assert_eq!(listed.tools[0].description, tool.description);
     }
 }
