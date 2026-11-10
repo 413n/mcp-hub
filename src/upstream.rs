@@ -31,6 +31,7 @@ use crate::config::{Auth, Endpoint, ServerConfig, StdioCommand};
 use crate::hub::hub_tools;
 use crate::oauth::{KeyringCredentialStore, secret_env_key};
 use crate::secrets::SecretStore;
+use crate::stats::Stats;
 
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
 const LIST_TIMEOUT: Duration = Duration::from_secs(60);
@@ -67,6 +68,7 @@ struct Conn {
     service: Client,
     /// A command server's process. It leads its own process group, which holds all it started.
     pid: Option<u32>,
+    since: Instant,
 }
 
 impl Conn {
@@ -211,6 +213,7 @@ pub struct Upstream {
     pub server: ServerConfig,
     store: SecretStore,
     timings: Timings,
+    stats: Stats,
     /// For the background tasks, which must not keep a dropped upstream alive.
     me: Weak<Upstream>,
     conn: Mutex<Option<Conn>>,
@@ -241,14 +244,25 @@ impl Drop for RefreshDone {
 
 impl Upstream {
     pub fn new(server: ServerConfig, store: SecretStore) -> Arc<Self> {
-        Self::with_timings(server, store, Timings::default())
+        Self::with(server, store, Timings::default(), Stats::off())
     }
 
     pub fn with_timings(server: ServerConfig, store: SecretStore, timings: Timings) -> Arc<Self> {
+        Self::with(server, store, timings, Stats::off())
+    }
+
+    /// An upstream that records in `stats` when it connects, stops and fails.
+    pub fn with(
+        server: ServerConfig,
+        store: SecretStore,
+        timings: Timings,
+        stats: Stats,
+    ) -> Arc<Self> {
         Arc::new_cyclic(|me| Self {
             server,
             store,
             timings,
+            stats,
             me: me.clone(),
             conn: Mutex::new(None),
             connections: AtomicU64::new(0),
@@ -430,11 +444,13 @@ impl Upstream {
         }
         if let Some(conn) = slot.take() {
             tracing::info!("[{}] {} by itself", self.name(), self.gone());
+            self.stopped(&conn, "exited");
             tokio::spawn(conn.close());
         }
         if let Some(e) = self.failing() {
             return Err(e);
         }
+        let started = Instant::now();
         let connected = tokio::time::timeout(CONNECT_TIMEOUT, self.connect())
             .await
             .unwrap_or_else(|_| Err(UpstreamError::Other("connection timed out".into())));
@@ -444,9 +460,20 @@ impl Upstream {
                     Some(pid) => tracing::info!("[{}] started, pid {pid}", self.name()),
                     None => tracing::debug!("[{}] connected", self.name()),
                 }
+                let ms = started.elapsed().as_millis() as u64;
+                self.stats.record(
+                    "connect",
+                    serde_json::json!({"server": self.name(), "pid": pid, "ms": ms}),
+                );
                 let id = self.connections.fetch_add(1, Ordering::Relaxed);
-                let conn = slot.insert(Conn { id, service, pid });
-                *self.last_used.lock().unwrap() = Instant::now();
+                let since = Instant::now();
+                let conn = slot.insert(Conn {
+                    id,
+                    service,
+                    pid,
+                    since,
+                });
+                *self.last_used.lock().unwrap() = since;
                 if let Some(idle) = self.server.idle_timeout {
                     tokio::spawn(close_when_idle(self.me.clone(), id, idle));
                 }
@@ -465,14 +492,28 @@ impl Upstream {
     }
 
     /// Give up connection `id`, if it is still the current one, so the next request
-    /// reconnects. It is closed in the background: that can take a few seconds.
-    async fn reset(&self, id: u64) {
+    /// reconnects. It is closed in the background: that can take a few seconds. `why` is
+    /// for the record.
+    async fn reset(&self, id: u64, why: &str) {
         let mut slot = self.conn.lock().await;
         if slot.as_ref().is_some_and(|conn| conn.id == id)
             && let Some(conn) = slot.take()
         {
+            self.stopped(&conn, why);
             tokio::spawn(conn.close());
         }
+    }
+
+    /// Record that `conn` is being closed, and why.
+    fn stopped(&self, conn: &Conn, why: &str) {
+        self.stats.record(
+            "stop",
+            serde_json::json!({
+                "server": self.name(),
+                "why": why,
+                "upSeconds": conn.since.elapsed().as_secs(),
+            }),
+        );
     }
 
     /// Whether the upstream is connected right now (a command server: running).
@@ -492,16 +533,29 @@ impl Upstream {
     /// Note a failure: the upstream is not tried again for a while, longer each time in a
     /// row, so that agents asking for it do not turn one failure into a stream of attempts.
     fn failed(&self, error: &UpstreamError) {
+        let record = |retry: Duration| {
+            let message: String = error.to_string().chars().take(160).collect();
+            self.stats.record(
+                "fail",
+                serde_json::json!({
+                    "server": self.name(),
+                    "error": message,
+                    "retrySeconds": retry.as_secs(),
+                }),
+            );
+        };
         // A missing or expired login is fixed by a command, which must work at once.
         if matches!(error, UpstreamError::NeedsLogin(_)) {
-            return;
+            return record(Duration::ZERO);
         }
         let mut failing = self.failing.lock().unwrap();
         let count = failing.as_ref().map_or(0, |f| f.count) + 1;
         let delay = self.timings.retry_delay * 2u32.saturating_pow(count - 1);
+        let delay = delay.min(MAX_RETRY_DELAY);
+        record(delay);
         *failing = Some(Failing {
             count,
-            until: Instant::now() + delay.min(MAX_RETRY_DELAY),
+            until: Instant::now() + delay,
             error: error.to_string(),
         });
     }
@@ -526,19 +580,30 @@ impl Upstream {
     pub async fn list_tools(&self) -> Result<Vec<Tool>, UpstreamError> {
         for attempt in 0..2 {
             let lease = self.lease(false).await?;
+            let started = Instant::now();
             let listing = tokio::time::timeout(LIST_TIMEOUT, lease.peer.list_all_tools()).await;
             let error = match listing {
                 Ok(Ok(tools)) => {
                     self.succeeded();
+                    let listed = hub_tools(self.name(), &tools);
+                    self.stats.record(
+                        "tools",
+                        serde_json::json!({
+                            "server": self.name(),
+                            "ms": started.elapsed().as_millis() as u64,
+                            "tools": listed.len(),
+                            "bytes": serde_json::to_vec(&listed).map_or(0, |json| json.len()),
+                        }),
+                    );
                     *self.cache.lock().unwrap() = Some(CachedTools {
-                        tools: Arc::new(hub_tools(self.name(), &tools)),
+                        tools: Arc::new(listed),
                         fetched: Instant::now(),
                     });
                     return Ok(tools);
                 }
                 Ok(Err(ServiceError::McpError(e))) => UpstreamError::Mcp(e),
                 Ok(Err(e)) => {
-                    self.reset(lease.id).await;
+                    self.reset(lease.id, "error").await;
                     // An old connection may just have gone stale (session expired, server
                     // restarted): listing is idempotent, so try once more on a new one.
                     if !lease.fresh && attempt == 0 {
@@ -547,7 +612,7 @@ impl Upstream {
                     self.convert(e)
                 }
                 Err(_) => {
-                    self.reset(lease.id).await;
+                    self.reset(lease.id, "error").await;
                     UpstreamError::Other("tools/list timed out".into())
                 }
             };
@@ -636,7 +701,7 @@ impl Upstream {
                 }
                 Ok(Err(e)) => {
                     if !matches!(e, ServiceError::McpError(_)) {
-                        self.reset(lease.id).await;
+                        self.reset(lease.id, "error").await;
                     }
                     Err(self.convert(e))
                 }
@@ -663,7 +728,7 @@ impl Upstream {
             // An error for an answer still shows that it is listening.
             if !matches!(answer, Ok(Ok(_) | Err(ServiceError::McpError(_)))) {
                 tracing::warn!("[{}] {}: it no longer answers", me.name(), me.gone());
-                me.reset(id).await;
+                me.reset(id, "unresponsive").await;
             }
         });
     }
@@ -672,6 +737,7 @@ impl Upstream {
     pub async fn close(&self) {
         let conn = self.conn.lock().await.take();
         if let Some(conn) = conn {
+            self.stopped(&conn, "shutdown");
             conn.close().await;
         }
     }
@@ -705,6 +771,7 @@ async fn close_when_idle(upstream: Weak<Upstream>, id: u64, idle: Duration) {
         if closed || unused {
             let Some(conn) = slot.take() else { return };
             drop(slot);
+            upstream.stopped(&conn, if closed { "exited" } else { "idle" });
             if closed {
                 tracing::info!("[{}] {} by itself", upstream.name(), upstream.gone());
             } else {
@@ -756,7 +823,7 @@ async fn stop_when_too_large(upstream: Weak<Upstream>, id: u64, pid: u32, limit_
                 "[{}] stopped: it uses {used} MB, more than its maxMemoryMb of {limit_mb}",
                 upstream.name()
             );
-            upstream.reset(id).await;
+            upstream.reset(id, "memory").await;
             return;
         }
         was_over = used > limit_mb;

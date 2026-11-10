@@ -280,6 +280,7 @@ How it runs:
 ## Day to day
 
     mcp-hub status             # can every upstream be reached?
+    mcp-hub stats              # what the hub did lately (see "Measurements")
     mcp-hub login <server>     # OAuth login in the browser (also to re-login)
     mcp-hub logout <server>    # delete stored credentials for a server
     mcp-hub set-token <server> # static token for a "bearer" server
@@ -311,6 +312,30 @@ Upstream logins (`login`, `set-token`) are picked up without a restart (a local
 server that is already running keeps its environment until it restarts). Config
 changes and `token --rotate` need one.
 
+### Measurements
+
+The hub keeps a record of what it does, to see which tools are used, what
+fails and what costs agents context:
+
+    mcp-hub stats              # the last 7 days
+    mcp-hub stats --days 30    # another period
+    mcp-hub stats --all        # also name the tools nobody called
+    mcp-hub stats --json       # the same numbers, for a script or an agent
+
+It shows, per tool, the calls, failures, durations and result sizes; the same
+per agent (an agent that was not given a server shows as "without <server>");
+how often each server connected, stopped and why, and failed; and, asked of the
+running hub, how large the tool definitions are and which tools were never
+called.
+
+The record is a file on this machine,
+`~/.local/state/mcp-hub/events.jsonl` (`$XDG_STATE_HOME` is honoured), readable
+by you alone: one line of JSON per tool call, tool list, server start, stop and
+failure. It holds names, sizes, durations and outcomes, and the hub's own error
+messages; never the arguments of a call or what it returned. Nothing is sent
+anywhere. It is kept to about 8 MB (some 50,000 events), the oldest half
+dropped when full; delete the directory to start over.
+
 ### Troubleshooting
 
 - **Agent shows no hub tools**: `curl` check from step 1. No answer means the
@@ -340,12 +365,13 @@ changes and `token --rotate` need one.
 
 - Config: `~/.config/mcp-hub/config.json` (example: `config.example.json`)
 - Binary: `~/.local/bin/mcp-hub` (installer) or `~/.cargo/bin/mcp-hub` (from source)
+- Record for `mcp-hub stats`: `~/.local/state/mcp-hub/events.jsonl`
 - Service, Linux: `~/.config/systemd/user/mcp-hub.service`, generated from `systemd/`
 - Service, macOS: `~/Library/LaunchAgents/dev.mcp-hub.plist`, generated from `launchd/`
 - Code: `src/http.rs` (inbound checks), `src/hub.rs` (tool merging and routing),
   `src/connect.rs` (what agents run to reach the hub),
   `src/upstream.rs` (HTTP and stdio upstreams), `src/oauth.rs`, `src/login.rs`,
-  `src/secrets.rs` (keyring)
+  `src/secrets.rs` (keyring), `src/stats.rs` (the record and `mcp-hub stats`)
 
 ## Security model
 
@@ -358,6 +384,9 @@ changes and `token --rotate` need one.
   `key`), on macOS the login Keychain (generic passwords, service `mcp-hub`).
   Nothing secret is written to disk by mcp-hub, and nothing is synced between
   machines.
+- The record for `mcp-hub stats` says which tools were called, when and by which
+  agent, not with what or what came back; it stays on this machine, in a
+  directory only you can read.
 - The hub token only grants access to this localhost endpoint. Agents set up
   with `mcp-hub connect` or `mcp-hub headers` get it from the keyring each time,
   so it is in none of their config files, where a search or a pasted config

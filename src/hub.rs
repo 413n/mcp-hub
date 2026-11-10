@@ -1,6 +1,7 @@
 //! Merges the tools of several upstreams under "<server>__<tool>" names.
 
 use std::sync::Arc;
+use std::time::Instant;
 
 use rmcp::{
     ErrorData, RoleServer, ServerHandler,
@@ -11,7 +12,9 @@ use rmcp::{
     },
     service::RequestContext,
 };
+use serde_json::json;
 
+use crate::stats::Stats;
 use crate::upstream::{Upstream, UpstreamError};
 
 pub const SEP: &str = "__";
@@ -20,11 +23,17 @@ pub const SEP: &str = "__";
 /// Sent by `mcp-hub connect` and `mcp-hub headers` for servers with `skipWhenEnv`.
 pub const SKIP_HEADER: &str = "x-mcp-hub-skip";
 
+/// Request header naming the agent behind `mcp-hub connect`, which has no `User-Agent`
+/// of its own to go by.
+pub const CLIENT_HEADER: &str = "x-mcp-hub-client";
+
 /// What a request says about the client that sent it.
 #[derive(Default)]
 struct Client {
     /// Names of the servers left out for it.
     skip: Vec<String>,
+    /// What the agent calls itself, as "claude-code/2.1.0".
+    name: Option<String>,
 }
 
 impl Client {
@@ -35,12 +44,19 @@ impl Client {
         };
         let header = |name| http.headers.get(name).and_then(|value| value.to_str().ok());
         let names = header(SKIP_HEADER).unwrap_or_default().split(',');
+        let name = header(CLIENT_HEADER).or_else(|| header("user-agent"));
         Self {
             skip: names
                 .map(|name| name.trim().to_owned())
                 .filter(|name| !name.is_empty())
                 .collect(),
+            name: name.map(|name| name.chars().take(80).collect()),
         }
+    }
+
+    /// The servers left out, for an event; nothing when there are none.
+    fn skipped(&self) -> Option<&[String]> {
+        (!self.skip.is_empty()).then_some(&self.skip[..])
     }
 
     fn skips(&self, upstream: &Upstream) -> bool {
@@ -78,12 +94,39 @@ pub(crate) fn hub_tools(server: &str, tools: &[Tool]) -> Vec<Tool> {
 #[derive(Clone)]
 pub struct Hub {
     upstreams: Arc<Vec<Arc<Upstream>>>,
+    stats: Stats,
+}
+
+/// How much a tool call returned, for the record: characters of text, and bytes of
+/// structured content.
+fn sizes(response: &CallToolResponse) -> (usize, usize) {
+    let CallToolResponse::Complete(result) = response else {
+        return (0, 0);
+    };
+    let texts = result.content.iter().filter_map(|block| block.as_text());
+    let structured = result.structured_content.as_ref();
+    (
+        texts.map(|text| text.text.chars().count()).sum(),
+        structured.map_or(0, |value| value.to_string().len()),
+    )
+}
+
+/// Something the hub itself has to tell the agent about a call: a tool error, which the
+/// agent reads, rather than a protocol error.
+fn note(text: String) -> CallToolResponse {
+    CallToolResponse::Complete(CallToolResult::error(vec![ContentBlock::text(text)]))
 }
 
 impl Hub {
     pub fn new(upstreams: Vec<Arc<Upstream>>) -> Self {
+        Self::with_stats(upstreams, Stats::off())
+    }
+
+    /// A hub that records its tool calls in `stats`.
+    pub fn with_stats(upstreams: Vec<Arc<Upstream>>, stats: Stats) -> Self {
         Self {
             upstreams: Arc::new(upstreams),
+            stats,
         }
     }
 
@@ -166,7 +209,17 @@ impl ServerHandler for Hub {
         _request: Option<PaginatedRequestParams>,
         context: RequestContext<RoleServer>,
     ) -> Result<ListToolsResult, ErrorData> {
-        let tools = self.tools_for(&Client::of(&context)).await;
+        let (client, started) = (Client::of(&context), Instant::now());
+        let tools = self.tools_for(&client).await;
+        self.stats.record(
+            "list",
+            json!({
+                "client": client.name,
+                "skip": client.skipped(),
+                "ms": started.elapsed().as_millis() as u64,
+                "tools": tools.len(),
+            }),
+        );
         Ok(ListToolsResult::with_all_items(tools))
     }
 
@@ -182,30 +235,52 @@ impl ServerHandler for Hub {
                 None,
             ));
         };
-        if Client::of(&context).skips(upstream) {
+        let (client, started) = (Client::of(&context), Instant::now());
+        let (outcome, error, response) = if client.skips(upstream) {
             let var = upstream.server.skip_when_env.as_deref();
             let why = var
                 .map(|var| format!(" ({var} is set)"))
                 .unwrap_or_default();
-            return Ok(CallToolResponse::Complete(CallToolResult::error(vec![
-                ContentBlock::text(format!(
-                    "mcp-hub: {} is left out of this session{why}. \
-                     Use the tools this session has of its own for it.",
-                    upstream.name()
-                )),
-            ])));
-        }
-        request.name = tool.into();
-        match upstream.call_tool(request, context.ct).await {
-            Ok(response) => Ok(response),
-            Err(UpstreamError::Mcp(e)) => Err(e),
-            Err(e) => {
-                tracing::warn!("[{}] tools/call {full_name} failed: {e}", upstream.name());
-                Ok(CallToolResponse::Complete(CallToolResult::error(vec![
-                    ContentBlock::text(format!("mcp-hub: {e}")),
-                ])))
+            let text = format!(
+                "mcp-hub: {} is left out of this session{why}. \
+                 Use the tools this session has of its own for it.",
+                upstream.name()
+            );
+            ("skipped", None, Ok(note(text)))
+        } else {
+            request.name = tool.clone().into();
+            match upstream.call_tool(request, context.ct).await {
+                Ok(CallToolResponse::Complete(result)) if result.is_error == Some(true) => {
+                    ("tool_error", None, Ok(CallToolResponse::Complete(result)))
+                }
+                Ok(response) => ("ok", None, Ok(response)),
+                // Its message may repeat what was asked: only the code is recorded.
+                Err(UpstreamError::Mcp(e)) => {
+                    ("rpc_error", Some(format!("code {}", e.code.0)), Err(e))
+                }
+                Err(e) => {
+                    tracing::warn!("[{}] tools/call {full_name} failed: {e}", upstream.name());
+                    let text = format!("mcp-hub: {e}");
+                    ("failed", Some(e.to_string()), Ok(note(text)))
+                }
             }
-        }
+        };
+        let (text, structured) = response.as_ref().map_or((0, 0), sizes);
+        self.stats.record(
+            "call",
+            json!({
+                "server": upstream.name(),
+                "tool": tool,
+                "client": client.name,
+                "skip": client.skipped(),
+                "ms": started.elapsed().as_millis() as u64,
+                "outcome": outcome,
+                "error": error.map(|e| e.chars().take(160).collect::<String>()),
+                "text": text,
+                "structured": structured,
+            }),
+        );
+        response
     }
 }
 

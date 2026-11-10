@@ -414,3 +414,69 @@ async fn leaves_out_a_skipped_server() {
     );
     client.cancel().await.unwrap();
 }
+
+/// Calls, lists and what the upstreams did end up in the record, without their content.
+#[tokio::test]
+async fn records_what_happens() {
+    use mcp_hub::stats::{Stats, summary};
+    let dir = std::env::temp_dir().join(format!("mcp-hub-record-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    let stats = Stats::open(&dir);
+    let config = parse_config(
+        &json!({"servers": {
+            "fake": {"url": format!("http://127.0.0.1:{}/mcp", start_fake(Fake::default()).await)},
+            "gone": {"url": "http://127.0.0.1:9/mcp"},
+        }})
+        .to_string(),
+    )
+    .unwrap();
+    let store = SecretStore::memory();
+    store.set(mcp_hub::TOKEN_KEY, TOKEN).await.unwrap();
+    let upstreams = config
+        .servers
+        .iter()
+        .map(|s| Upstream::with(s.clone(), store.clone(), Timings::default(), stats.clone()));
+    let hub = Hub::with_stats(upstreams.collect(), stats);
+    let listener = http::bind(0).await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    tokio::spawn(async move { http::serve(listener, hub, TOKEN, CancellationToken::new()).await });
+
+    let (agent, bridge) = tokio::io::duplex(1 << 16);
+    let (input, output) = tokio::io::split(bridge);
+    tokio::spawn(mcp_hub::connect::run(
+        port,
+        store,
+        Vec::new(),
+        input,
+        output,
+    ));
+    let client = mcp_hub::upstream::client_info().serve(agent).await.unwrap();
+    client.list_all_tools().await.unwrap();
+    let mut params = CallToolRequestParams::new("fake__echo");
+    params.arguments = Some(json!({"secret": "hunter2"}).as_object().unwrap().clone());
+    client.call_tool(params).await.unwrap();
+    let _ = client
+        .call_tool(CallToolRequestParams::new("fake__fail"))
+        .await;
+    client
+        .call_tool(CallToolRequestParams::new("gone__x"))
+        .await
+        .unwrap();
+    client.cancel().await.unwrap();
+
+    let s = summary(&dir, 1, None);
+    assert_eq!(s["total"]["calls"], 3, "{s}");
+    assert_eq!(s["total"]["failed"], 2, "{s}");
+    assert_eq!(s["agents"][0]["agent"], "mcp-hub", "{s}");
+    assert_eq!(s["agents"][0]["toolLists"], 1, "{s}");
+    assert_eq!(s["servers"]["fake"]["connected"], 1, "{s}");
+    assert!(s["servers"]["gone"]["failed"].as_u64() >= Some(1), "{s}");
+    let record = std::fs::read_to_string(dir.join("events.jsonl")).unwrap();
+    assert!(record.contains(r#""tool":"echo""#), "{record}");
+    assert!(record.contains(r#""error":"code -32602""#), "{record}");
+    assert!(
+        !record.contains("hunter2") && !record.contains("upstream says no"),
+        "{record}"
+    );
+    std::fs::remove_dir_all(&dir).unwrap();
+}

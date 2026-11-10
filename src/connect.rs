@@ -15,7 +15,7 @@ use tokio::task::AbortHandle;
 
 use crate::TOKEN_KEY;
 use crate::config::Config;
-use crate::hub::SKIP_HEADER;
+use crate::hub::{CLIENT_HEADER, SKIP_HEADER};
 use crate::secrets::SecretStore;
 
 /// Sent on requests after `initialize`, as an HTTP client would.
@@ -60,6 +60,8 @@ struct Bridge<W> {
     headers: Mutex<Vec<(&'static str, String)>>,
     /// The version the hub and the agent agreed on, once they have.
     protocol: Mutex<Option<String>>,
+    /// What the agent called itself when it opened the session, for the hub's record.
+    agent: Mutex<Option<String>>,
     output: tokio::sync::Mutex<W>,
     /// The requests being forwarded, by id, so that a cancelled one can be dropped.
     running: Mutex<HashMap<String, AbortHandle>>,
@@ -103,6 +105,9 @@ impl<W: AsyncWrite + Unpin + Send + 'static> Bridge<W> {
             }
             if let Some(version) = self.protocol.lock().unwrap().as_ref() {
                 request = request.header(PROTOCOL_VERSION, version);
+            }
+            if let Some(agent) = self.agent.lock().unwrap().as_ref() {
+                request = request.header(CLIENT_HEADER, agent);
             }
             let response = match request.send().await {
                 Ok(response) => response,
@@ -201,6 +206,7 @@ where
         store,
         skip,
         protocol: Mutex::new(None),
+        agent: Mutex::new(None),
         output: tokio::sync::Mutex::new(output),
         running: Mutex::new(HashMap::new()),
     });
@@ -226,6 +232,14 @@ where
             continue;
         }
         let initialize = method == "initialize";
+        if initialize {
+            let info = &message["params"]["clientInfo"];
+            let name = info["name"].as_str().unwrap_or("unknown");
+            let agent = format!("{name}/{}", info["version"].as_str().unwrap_or("?"));
+            // Header values are printable ASCII.
+            let agent = agent.chars().filter(|c| c.is_ascii_graphic()).take(80);
+            *bridge.agent.lock().unwrap() = Some(agent.collect());
+        }
         let key = id.as_ref().map(Value::to_string);
         // Locked across the spawn, so the task cannot finish before it is listed.
         let mut running = bridge.running.lock().unwrap();

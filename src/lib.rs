@@ -8,6 +8,7 @@ pub mod hub;
 pub mod login;
 pub mod oauth;
 pub mod secrets;
+pub mod stats;
 pub mod update;
 pub mod upstream;
 

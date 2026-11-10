@@ -13,8 +13,9 @@ use mcp_hub::{
     login::login,
     oauth::{credential_keys, secret_env_key},
     secrets::SecretStore,
+    stats::{self, Stats},
     update,
-    upstream::Upstream,
+    upstream::{Timings, Upstream},
 };
 use tokio_util::sync::CancellationToken;
 
@@ -29,6 +30,8 @@ fn usage() -> String {
   set-token <server> <VAR>
                       store the value of VAR, one of a command server's \"secretEnv\" (same way)
   status              connect to every upstream and count its tools
+  stats [--days N] [--all] [--json]
+                      what the hub did lately: calls, failures, result and definition sizes
   token               print the inbound bearer token, creating it if needed
   token --rotate      replace the inbound token (then restart the hub)
   connect             for an agent's config: MCP on stdin/stdout, forwarded to the running hub
@@ -77,7 +80,16 @@ async fn serve(config: Config, store: SecretStore) -> Result<()> {
         .await
         .with_context(|| format!("cannot listen on 127.0.0.1:{}", config.port))?;
     let token = wait_for_token(&store).await;
-    let hub = Hub::new(upstreams(&config, &store));
+    let stats = Stats::open(&stats::state_dir());
+    stats.record(
+        "hub",
+        serde_json::json!({"version": env!("CARGO_PKG_VERSION"), "servers": config.servers.len()}),
+    );
+    let servers = config.servers.iter();
+    let upstreams = servers
+        .map(|s| Upstream::with(s.clone(), store.clone(), Timings::default(), stats.clone()))
+        .collect();
+    let hub = Hub::with_stats(upstreams, stats);
     let names: Vec<_> = hub
         .upstreams()
         .iter()
@@ -128,6 +140,34 @@ async fn status(config: Config, store: SecretStore) -> Result<bool> {
         upstream.close().await;
     }
     Ok(ok)
+}
+
+/// `mcp-hub stats`: the record of the last days, and the tools the running hub lists.
+async fn show_stats(config: Config, store: SecretStore, options: &[String]) -> Result<()> {
+    let (mut days, mut all, mut as_json) = (7, false, false);
+    let mut options = options.iter().map(String::as_str);
+    while let Some(option) = options.next() {
+        match (option, options.clone().next().and_then(|n| n.parse().ok())) {
+            ("--days", Some(n)) => {
+                days = n;
+                options.next();
+            }
+            ("--all", _) => all = true,
+            ("--json", _) => as_json = true,
+            _ => bail!("usage: mcp-hub stats [--days N] [--all] [--json]"),
+        }
+    }
+    let tools = match store.get(TOKEN_KEY).await {
+        Ok(Some(token)) => stats::listed_tools(config.port, &token).await.ok(),
+        _ => None,
+    };
+    let summary = stats::summary(&stats::state_dir(), days, tools.as_deref());
+    if as_json {
+        println!("{summary}");
+    } else {
+        print!("{}", stats::render(&summary, all));
+    }
+    Ok(())
 }
 
 async fn token(store: SecretStore, rotate: bool) -> Result<()> {
@@ -241,6 +281,10 @@ async fn run(args: &[String]) -> Result<ExitCode> {
         && cmd == "set-token"
     {
         set_token(load_config()?, store, name, Some(var)).await?;
+        return Ok(ExitCode::SUCCESS);
+    }
+    if args.first().map(String::as_str) == Some("stats") {
+        show_stats(load_config()?, store, &args[1..]).await?;
         return Ok(ExitCode::SUCCESS);
     }
     match (args.first().map(String::as_str), arg) {
