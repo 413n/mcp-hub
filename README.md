@@ -10,8 +10,9 @@ A single Rust binary built on the official MCP Rust SDK
 ([`rmcp`](https://github.com/modelcontextprotocol/rust-sdk)). Deliberately small:
 no dashboard, no admin API, no runtime reconfiguration.
 Stateless towards the agents, and it passes upstream results through without
-re-validating them, so memory stays flat (about 10 MB idle, under 100 MB while
-serving large tool lists; stdio servers are processes of their own on top).
+re-validating them, so memory stays flat: about 15 MB at start and about 30 MB
+with 170 tools (half a megabyte of JSON) cached, however many agents ask for
+them. Stdio servers are processes of their own on top, stopped while unused.
 
 Runs on Linux (GNOME keyring, systemd) and macOS (Keychain, launchd). Each
 machine is independent: only the code is shared through this repo. The config,
