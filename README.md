@@ -55,12 +55,12 @@ Re-run `bin/install-service.sh` after `git pull` to rebuild and restart.
 
 ### Either way
 
-`install-service.sh` sets up a systemd user unit (Linux) or a launchd agent
-(macOS) that starts the hub now and at every login. Until `mcp-hub token` has
-been run, the service waits for the token instead of exiting. Check that the
-hub is up:
+`install-service.sh` creates the hub token if missing, sets up a systemd user
+unit (Linux) or a launchd agent (macOS) that starts the hub now and at every
+login, and checks that the hub answers. If it does not, it says so and prints
+the command that starts it. Check at any time with:
 
-    curl -s -o /dev/null -w '%{http_code}\n' http://127.0.0.1:3050/mcp   # 401 = running (no token sent)
+    mcp-hub check              # or: curl -s -o /dev/null -w '%{http_code}\n' http://127.0.0.1:3050/mcp (401 = running)
 
 **macOS:** the first time the hub reads the Keychain, macOS asks whether
 `mcp-hub` may access it: choose *Always Allow*. Each rebuild is a new binary to
@@ -76,7 +76,9 @@ keyring:
 - `mcp-hub headers` prints the headers as JSON, for agents that can run a
   command to get them (Claude Code).
 - `mcp-hub connect` is a small stdio MCP server that forwards everything to the
-  running hub, for the others (Codex, Cursor).
+  running hub, for the others (Codex, Cursor, Claude Desktop). It also tells the
+  agent when the hub's tools change (`notifications/tools/list_changed`), as when
+  a slow server comes up after the agent first asked.
 
 Register the hub once per agent; servers you add to the hub later show up
 without touching the agents again. The commands below write the full path of
@@ -121,6 +123,23 @@ If the file already has other servers, add only the `"hub"` entry inside
 `mcpServers`. Then open Cursor Settings → MCP (Tools & Integrations) and check
 that `hub` is enabled and lists its tools.
 
+### Claude Desktop
+
+Add to `~/Library/Application Support/Claude/claude_desktop_config.json` (macOS;
+`Settings → Developer → Edit Config` opens it), then restart Claude Desktop:
+
+    {
+      "mcpServers": {
+        "hub": {
+          "command": "/Users/you/.local/bin/mcp-hub",
+          "args": ["connect"]
+        }
+      }
+    }
+
+It replaces a `mcp-remote` entry with the token in it (`npx mcp-remote
+http://127.0.0.1:3050/mcp --header ...`), if you had one.
+
 ### Any other agent
 
 Give it `mcp-hub connect` as a stdio server. If it only speaks HTTP, give it the
@@ -131,10 +150,24 @@ URL and the header `Authorization: Bearer <token>`, with the output of
 
     mcp-hub token --rotate
 
-Then restart the hub (see "Day to day"). Agents set up as above need no change:
+The running hub takes the new token at once and turns the old one down from the
+moment the command returns; no restart. Agents set up as above need no change:
 `connect` reads the new token by itself, and Claude Code asks `headers` again
 when a session starts. Only a config that holds the token itself has to be
-edited.
+edited. (A hub older than 0.5 cannot take a new token while running: the command
+then says to restart it.)
+
+### Upgrading from 0.3
+
+Up to 0.3 the agents' configs held the token itself. To move to `connect` and
+`headers`:
+
+1. `mcp-hub update`.
+2. Set up each agent as above, replacing its old `hub` entry: Claude Code,
+   Codex, Cursor, Claude Desktop, and any other that has the hub's URL with an
+   `Authorization` header.
+3. `mcp-hub token --rotate`, so that the copies of the token left in old configs
+   and their backups stop working.
 
 ## 3. Add upstream servers
 
@@ -333,6 +366,7 @@ How it runs:
     mcp-hub set-token <server> # static token for a "bearer" server
     mcp-hub set-token <server> <VAR>  # a "secretEnv" value for a local server
     mcp-hub token [--rotate]   # print (or replace) the hub token
+    mcp-hub check [--wait N]   # does the hub answer? (exit status 0 if so)
     mcp-hub connect            # what agents run: MCP on stdin/stdout, forwarded to the hub
     mcp-hub headers            # what agents run: the HTTP headers for the hub, as JSON
     mcp-hub update [--check]   # update to the latest release (one-line installs)
@@ -342,6 +376,12 @@ Restart after editing the config:
 
     systemctl --user restart mcp-hub                     # Linux
     launchctl kickstart -k gui/$(id -u)/dev.mcp-hub      # macOS
+
+Stopping takes a few seconds at most: calls still running get 3 seconds to
+finish, and local servers that do not exit within 2 more are killed. After a
+restart the hub lists every server's tools at once, from the lists it saved
+before (`~/.local/state/mcp-hub/tools/`), and fetches them again as each server
+starts.
 
 Update: `mcp-hub update` for one-line installs (it runs that release's
 `install.sh`: checksum check, binary swap, service restart; config, logins and
@@ -355,9 +395,9 @@ servers' stderr is logged at `info` under the target `mcp_hub::stderr`, so
     journalctl --user -u mcp-hub -f                     # Linux
     tail -f ~/Library/Logs/mcp-hub.log                   # macOS
 
-Upstream logins (`login`, `set-token`) are picked up without a restart (a local
-server that is already running keeps its environment until it restarts). Config
-changes and `token --rotate` need one.
+Upstream logins (`login`, `set-token`) and `token --rotate` are picked up
+without a restart (a local server that is already running keeps its environment
+until it restarts). Config changes need one.
 
 ### Measurements
 
@@ -385,10 +425,16 @@ dropped when full; delete the directory to start over.
 
 ### Troubleshooting
 
-- **Agent shows no hub tools**: `curl` check from step 1. No answer means the
-  service is not running: check the logs. `401` from the agent means its token
-  is stale: restart the hub if you rotated the token, and if the agent's config
-  holds the token itself, copy the current one from `mcp-hub token`.
+- **Agent shows no hub tools**: `mcp-hub check`. No answer means the service is
+  not running: check the logs. `401` from the agent means its token is stale: if
+  the agent's config holds the token itself, copy the current one from
+  `mcp-hub token`, or better, set it up with `connect` or `headers`.
+- **Some servers' tools missing right after a restart**: agents set up with
+  `connect` are told when they arrive. Claude Code set up with `headers` keeps
+  the list it got when its session started: `/mcp` → hub → reconnect.
+- **`mcp-hub update` or `install-service.sh` says the hub is not running**: the
+  new binary is in place; run the command it prints, then `mcp-hub check`. On
+  macOS, look first for a Keychain dialog: the hub waits for it.
 - **One server missing**: `mcp-hub status`. A `FAIL` saying to log in means its
   login is missing or expired: run `login` (or `set-token`) again.
 - **Local server FAIL "cannot start"**: the `command` path is wrong, or a bare
@@ -414,6 +460,7 @@ dropped when full; delete the directory to start over.
 - Binary: `~/.local/bin/mcp-hub` (installer) or `~/.cargo/bin/mcp-hub` (from source)
 - Record for `mcp-hub stats`: `~/.local/state/mcp-hub/events.jsonl`
 - Results too large to pass on whole: `~/.local/state/mcp-hub/results/` (kept an hour)
+- Each server's last tool list, for a restarted hub: `~/.local/state/mcp-hub/tools/`
 - Service, Linux: `~/.config/systemd/user/mcp-hub.service`, generated from `systemd/`
 - Service, macOS: `~/Library/LaunchAgents/dev.mcp-hub.plist`, generated from `launchd/`
 - Code: `src/http.rs` (inbound checks), `src/hub.rs` (tool merging and routing),
@@ -428,6 +475,9 @@ dropped when full; delete the directory to start over.
 - Every request must come from loopback, have the exact `Host`
   (`127.0.0.1:3050` or `localhost:3050`), no `Origin` header (so browser pages
   are refused), and the bearer token (compared in constant time).
+- Besides `/mcp`, the hub answers one path, `/reload-token`, used by
+  `mcp-hub token --rotate`: with the current token, it makes the hub read the
+  token from the keyring again. Nothing else.
 - Upstream OAuth credentials, static tokens and the hub token live in the OS
   keyring: on Linux the Secret Service (schema `dev.mcp-hub.Secret`, attribute
   `key`), on macOS the login Keychain (generic passwords, service `mcp-hub`).
@@ -454,6 +504,18 @@ dropped when full; delete the directory to start over.
 
     cargo test                 # unit tests + end-to-end tests with fake HTTP and stdio upstreams
     cargo clippy --all-targets
+
+To try a change to the service setup next to the hub you use, give the test
+instance its own name, binary, config (with another `port`) and state:
+
+    MCP_HUB_SERVICE=mcp-hub-test MCP_HUB_BIN=/tmp/hub-test/mcp-hub \
+      MCP_HUB_CONFIG=/tmp/hub-test/config.json MCP_HUB_STATE=/tmp/hub-test/state \
+      bin/install-service.sh
+
+(on macOS name it `dev.mcp-hub-test`). It shares the keyring, so do not rotate
+the token from it. Remove it afterwards: `systemctl --user disable --now
+mcp-hub-test` and its unit file, or `launchctl bootout gui/$(id -u)/dev.mcp-hub-test`
+and its plist.
 
 ### Releasing
 
