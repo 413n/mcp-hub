@@ -287,7 +287,9 @@ fn init_logging(serving: bool) {
     }
 }
 
-#[tokio::main]
+// Two workers: the hub mostly waits on sockets, and with glibc every extra worker thread
+// keeps its own malloc arena, each holding on to the memory of the largest burst it served.
+#[tokio::main(flavor = "multi_thread", worker_threads = 2)]
 async fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
     init_logging(args.first().map(String::as_str) == Some("serve"));
