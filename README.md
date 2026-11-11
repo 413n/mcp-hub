@@ -63,30 +63,38 @@ the command that starts it. Check at any time with:
     mcp-hub check              # or: curl -s -o /dev/null -w '%{http_code}\n' http://127.0.0.1:3050/mcp (401 = running)
 
 **macOS:** the first time `mcp-hub` reads the Keychain, macOS asks for your
-password to let it: choose *Always Allow*. Each update or rebuild is a new
-binary to macOS, so it asks again once after every `install-service.sh`, unless
-you sign it (below). Once: all of mcp-hub's secrets are in a single Keychain item. (Versions up to 0.4 kept
-one item per secret. The first time 0.5 or later needs one of those, macOS asks
-for it one last time while it moves into the single item.)
+password to let it: choose *Always Allow*. All of mcp-hub's secrets are in a
+single Keychain item, so it asks once. Updates do not ask again: release
+binaries are all signed with the same certificate (below), so macOS knows each
+new version as the same program. (Versions before 0.6 were not signed and asked
+after every update; installing the first signed one asks once more. Versions up
+to 0.4 kept one item per secret: the first time 0.5 or later needs one of those,
+macOS asks for it one last time while it moves into the single item.)
 
-### Signing on macOS (optional)
+### Signing on macOS
 
-Release binaries are not signed by a paid Apple developer account. To macOS each
-new version is then a different program, so the Keychain asks again after every
-update. It stops asking once you sign them with a certificate of your own, made
-once on your Mac (nothing to pay, and it never leaves the Mac):
+Release binaries for macOS are signed with mcp-hub's own certificate,
+`mcp-hub release`. It is self-signed, not issued by Apple: it does not make
+macOS trust the binary any more (installed with `install.sh` it needs no
+trust), but it gives every release the same identity, which is what the
+Keychain's *Always Allow* is tied to. Check it with
+`codesign -dv ~/.local/bin/mcp-hub` (`Authority=mcp-hub release`).
+
+Builds from a clone are not signed, so the Keychain asks after each
+`install-service.sh`. To stop that, make a certificate of your own, once (nothing
+to pay, and it never leaves the Mac):
 
 1. Open *Keychain Access*, then in the menu *Keychain Access → Certificate
    Assistant → Create a Certificate…*
 2. Name: `mcp-hub`, Identity Type: *Self Signed Root*, Certificate Type: *Code
    Signing*. Create.
-3. Install again, which now signs the binary: `mcp-hub update <the version you
-   have>` (see `mcp-hub --version`), or `bin/install-service.sh` from a clone.
-   macOS asks whether `codesign` may use the new key, then the Keychain asks
-   about mcp-hub once more: *Always Allow* both.
+3. Run `bin/install-service.sh` again. macOS asks whether `codesign` may use the
+   new key, then the Keychain asks about mcp-hub once more: *Always Allow* both.
 
-From then on the installer signs each update with it, and macOS asks no more.
-(To use a certificate with another name: `MCP_HUB_SIGN=<name>`.)
+From then on `install-service.sh` signs every build with it (also release
+binaries, if you install those on the same Mac: switching between the two
+certificates asks again). To use a certificate with another name:
+`MCP_HUB_SIGN=<name>`.
 
 ## 2. Connect your agents
 
@@ -414,9 +422,10 @@ starts.
 
 Update: `mcp-hub update` for one-line installs (it runs that release's
 `install.sh`: checksum check, binary swap, service restart; config, logins and
-token stay). For a clone: `git pull && bin/install-service.sh`. On macOS the
-Keychain asks once more after an update, during the install: choose *Always
-Allow* (or sign it, see [Signing on macOS](#signing-on-macos-optional)).
+token stay). For a clone: `git pull && bin/install-service.sh`. On macOS a build
+from a clone has the Keychain ask once more after each update, during the
+install: choose *Always Allow* (or sign it, see
+[Signing on macOS](#signing-on-macos)).
 
 `mcp-hub status` asks the running hub, which has the servers' logins at hand
 and checks them all at once; only when no hub runs does it connect to each
@@ -535,6 +544,10 @@ dropped when full; delete the directory to start over.
 - The keyring is readable by any process running as you while you are logged in
   (on macOS, other apps get a prompt). It protects against disk theft and stray
   files, not against your own user.
+- On macOS, *Always Allow* lets any binary signed with the `mcp-hub release`
+  certificate (and identifier `dev.mcp-hub`) read mcp-hub's Keychain item
+  without asking. Its key is only in this repository's GitHub Actions secrets,
+  which sign the releases.
 
 ## Development
 
@@ -563,3 +576,21 @@ Linux and macOS in parallel runs the tests, builds the `linux-x86_64` and
 `macos-universal` archives (with SHA-256 checksums) and uploads them, and
 finally publishes `v<version>`. It refuses to overwrite a published release; a
 draft left by a failed run is replaced on the next run.
+
+The macOS binary is signed with the certificate in the repository secrets
+`MACOS_SIGN_P12` (a PKCS#12 file, base64) and `MACOS_SIGN_PASSWORD`; the
+workflow fails without them. They were made with:
+
+    openssl req -x509 -newkey rsa:3072 -sha256 -days 7305 -nodes -keyout key.pem -out cert.pem \
+      -subj "/CN=mcp-hub release" -addext "basicConstraints=critical,CA:false" \
+      -addext "keyUsage=critical,digitalSignature" -addext "extendedKeyUsage=critical,codeSigning"
+    openssl rand -base64 32 | tr -d '\n' > pass
+    openssl pkcs12 -export -inkey key.pem -in cert.pem -name "mcp-hub release" \
+      -certpbe PBE-SHA1-3DES -keypbe PBE-SHA1-3DES -macalg sha1 -passout file:pass -out sign.p12
+    base64 -w0 sign.p12 | gh secret set MACOS_SIGN_P12 && gh secret set MACOS_SIGN_PASSWORD < pass
+    rm key.pem cert.pem pass sign.p12
+
+(The old PKCS#12 algorithms because macOS cannot read OpenSSL 3's default.) A
+new certificate, or later an Apple Developer ID one under another name (change
+`--sign` in the workflow), works the same; each Mac's Keychain asks once more
+after the first release signed with it.

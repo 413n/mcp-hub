@@ -14,14 +14,14 @@
 #   MCP_HUB_BIN      where to install the binary (from a clone: built, then copied there)
 #   MCP_HUB_CONFIG, MCP_HUB_STATE
 #                    passed on to the service (use a config with another port)
-# On macOS, MCP_HUB_SIGN names the certificate to sign the binary with (default: mcp-hub;
-# see "Signing on macOS" in the README). Without one the binary stays unsigned.
+# On macOS, MCP_HUB_SIGN names a certificate of your own to sign the binary with (default:
+# mcp-hub; see "Signing on macOS" in the README). Without one the binary keeps its signature:
+# release binaries are signed, builds from a clone are not.
 set -euo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 OS="$(uname -s)"
 SIGN_AS="${MCP_HUB_SIGN:-mcp-hub}"
-SIGNED=""
 
 # macOS: sign binary $1 with your own certificate, if there is one, so that the Keychain
 # knows each new version as the same program and does not ask again.
@@ -29,12 +29,12 @@ sign() {
   [[ "$OS" == Darwin ]] || return 0
   # Without -v: a self-signed certificate is not "valid" (trusted), and need not be.
   security find-identity -p codesigning 2>/dev/null | grep -qF "\"$SIGN_AS\"" || return 0
-  if codesign --force --sign "$SIGN_AS" --identifier dev.mcp-hub "$1"; then
-    SIGNED=1
-  else
-    echo "Warning: could not sign $1 with the certificate \"$SIGN_AS\"; it stays unsigned." >&2
-  fi
+  codesign --force --sign "$SIGN_AS" --identifier dev.mcp-hub "$1" ||
+    echo "Warning: could not sign $1 with the certificate \"$SIGN_AS\"." >&2
 }
+
+# Whether $BIN is signed with a certificate (not only ad hoc, as builds are by default).
+signed() { codesign --display --verbose=2 "$BIN" 2>&1 | grep -q '^Authority='; }
 
 # Put binary $1 in place as $BIN: copy to a temp name, sign, and rename, so a running
 # service keeps its old binary until restarted.
@@ -82,7 +82,7 @@ fi
 # Keychain asks whether the new binary may read it.
 if [[ "$OS" == Darwin ]]; then
   echo "If macOS asks for your password to let mcp-hub use the Keychain: choose Always Allow."
-  if [[ -z "$SIGNED" ]]; then
+  if ! signed; then
     echo "(It asks after every update. To stop that, see \"Signing on macOS\" in the README.)"
   fi
 fi

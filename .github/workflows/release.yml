@@ -113,13 +113,44 @@ jobs:
           for t in $TARGETS; do bins+=("target/$t/release/mcp-hub"); done
           if [[ "$RUNNER_OS" == macOS ]]; then
             lipo -create -output mcp-hub "${bins[@]}"
-            # Ad-hoc signature: required to run on Apple Silicon.
-            codesign --force --sign - mcp-hub
             lipo -info mcp-hub
           else
             cp "${bins[0]}" mcp-hub
           fi
-          ./mcp-hub --version
+
+      # Signed with mcp-hub's own self-signed certificate (secrets MACOS_SIGN_P12, base64 of
+      # a PKCS#12 file, and MACOS_SIGN_PASSWORD; see "Releasing" in the README). Not trusted
+      # by Apple, and need not be: it gives every release the same identity, so the Keychain
+      # lets a new version in without asking again.
+      - name: Sign
+        if: runner.os == 'macOS'
+        env:
+          SIGN_P12: ${{ secrets.MACOS_SIGN_P12 }}
+          SIGN_PASSWORD: ${{ secrets.MACOS_SIGN_PASSWORD }}
+        run: |
+          if [[ -z "$SIGN_P12" || -z "$SIGN_PASSWORD" ]]; then
+            echo "::error::secrets MACOS_SIGN_P12 and MACOS_SIGN_PASSWORD are not set"
+            exit 1
+          fi
+          keychain="$RUNNER_TEMP/sign.keychain-db"
+          keychain_password="$(uuidgen)"
+          trap 'security delete-keychain "$keychain" 2>/dev/null || true; rm -f "$RUNNER_TEMP/sign.p12"' EXIT
+          security create-keychain -p "$keychain_password" "$keychain"
+          security set-keychain-settings -lut 900 "$keychain"
+          security unlock-keychain -p "$keychain_password" "$keychain"
+          printf '%s' "$SIGN_P12" | base64 --decode > "$RUNNER_TEMP/sign.p12"
+          security import "$RUNNER_TEMP/sign.p12" -k "$keychain" -P "$SIGN_PASSWORD" \
+            -T /usr/bin/codesign >/dev/null
+          # Let codesign use the key without a dialog.
+          security set-key-partition-list -S apple-tool:,apple: -s -k "$keychain_password" \
+            "$keychain" >/dev/null
+          codesign --force --keychain "$keychain" --sign "mcp-hub release" \
+            --identifier dev.mcp-hub mcp-hub
+          codesign --display --verbose=2 mcp-hub 2>&1 | grep -E '^(Identifier|Authority|Signature)='
+          codesign --display --requirements - mcp-hub 2>&1 | grep designated
+
+      - name: Check binary
+        run: ./mcp-hub --version
 
       - name: Package and upload
         run: |
