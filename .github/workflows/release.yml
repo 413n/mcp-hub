@@ -144,8 +144,20 @@ jobs:
           # Let codesign use the key without a dialog.
           security set-key-partition-list -S apple-tool:,apple: -s -k "$keychain_password" \
             "$keychain" >/dev/null
-          codesign --force --keychain "$keychain" --sign "mcp-hub release" \
-            --identifier dev.mcp-hub mcp-hub
+          # codesign looks for the key in the search list only.
+          old_keychains=()
+          while IFS= read -r line; do
+            line="${line#"${line%%[![:space:]]*}"}"
+            old_keychains+=("${line//\"/}")
+          done < <(security list-keychains -d user)
+          security list-keychains -d user -s "$keychain" "${old_keychains[@]}"
+          # By its SHA-1, not its name: codesign looks names up among trusted certificates
+          # only, and a self-signed one is not. (Without -v, find-identity lists those too.)
+          security find-identity -p codesigning "$keychain"
+          identity="$(security find-identity -p codesigning "$keychain" |
+            awk '/"mcp-hub release"/ { print $2; exit }')"
+          [[ -n "$identity" ]] || { echo "::error::no mcp-hub release identity in the secrets"; exit 1; }
+          codesign --force --keychain "$keychain" --sign "$identity" --identifier dev.mcp-hub mcp-hub
           codesign --display --verbose=2 mcp-hub 2>&1 | grep -E '^(Identifier|Authority|Signature)='
           codesign --display --requirements - mcp-hub 2>&1 | grep designated
 
