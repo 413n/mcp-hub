@@ -16,6 +16,14 @@ RELEASES="${MCP_HUB_RELEASES:-https://github.com/$REPO/releases}"
 say() { printf '%s\n' "$*"; }
 fail() { printf 'mcp-hub install: %s\n' "$*" >&2; exit 1; }
 
+# Color on a terminal only (and not with NO_COLOR).
+if [ -t 1 ] && [ -z "${NO_COLOR:-}" ] && [ "${TERM:-}" != dumb ]; then
+  esc="$(printf '\033')"
+  bold="${esc}[1m" dim="${esc}[2m" green="${esc}[32m" cyan="${esc}[36m" reset="${esc}[0m"
+else
+  bold="" dim="" green="" cyan="" reset=""
+fi
+
 for cmd in curl tar bash; do
   command -v "$cmd" >/dev/null 2>&1 || fail "$cmd is required"
 done
@@ -42,7 +50,7 @@ name="mcp-hub-$version-$platform"
 tmp="$(mktemp -d)"
 trap 'rm -rf "$tmp"' EXIT INT TERM
 
-say "Downloading mcp-hub $version ($platform)..."
+say "${dim}Downloading mcp-hub $version ($platform)...${reset}"
 curl -fsSL -o "$tmp/$name.tar.gz" "$RELEASES/download/v$version/$name.tar.gz" ||
   fail "download failed: $RELEASES/download/v$version/$name.tar.gz"
 curl -fsSL -o "$tmp/$name.tar.gz.sha256" "$RELEASES/download/v$version/$name.tar.gz.sha256" ||
@@ -58,25 +66,29 @@ fi
 
 tar -xzf "$tmp/$name.tar.gz" -C "$tmp"
 
+bin="$HOME/.local/bin/mcp-hub"
+# A first install gets the next steps; an update does not need them again.
+first=yes
+[ -x "$bin" ] && first=""
+
 config="$HOME/.config/mcp-hub/config.json"
 if [ ! -f "$config" ]; then
   mkdir -p "$(dirname "$config")"
   cp "$tmp/$name/config.example.json" "$config"
   chmod 600 "$config"
-  say "Created $config (no servers yet)."
+  say "${dim}Created $config (no servers yet).${reset}"
 fi
 
 # Installs the binary, creates the hub token if missing, (re)starts the service and checks
 # that the hub answers; if it does not, it says how to start it.
 bash "$tmp/$name/install-service.sh"
 
-bin="$HOME/.local/bin/mcp-hub"
 say ""
-say "mcp-hub $version is installed and running."
+say "${green}✓${reset} ${bold}mcp-hub $version is installed.${reset}"
+[ -n "$first" ] || exit 0
 say ""
-say "Next steps (https://github.com/$REPO#2-connect-your-agents):"
+say "${bold}Next steps${reset} ${dim}(https://github.com/$REPO#2-connect-your-agents)${reset}"
 say "  1. Connect an agent, e.g. Claude Code:"
-say "       claude mcp add-json --scope user hub \\"
-say "         '{\"type\":\"http\",\"url\":\"http://127.0.0.1:3050/mcp\",\"headersHelper\":\"$bin headers\"}'"
+say "       ${cyan}claude mcp add --scope user hub -- $bin connect${reset}"
 say "  2. Add upstream servers to $config, then:"
-say "       $bin login <server>   or   $bin set-token <server>"
+say "       ${cyan}$bin login <server>${reset}   or   ${cyan}$bin set-token <server>${reset}"

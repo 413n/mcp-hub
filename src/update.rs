@@ -143,20 +143,35 @@ pub async fn update(target: Option<&str>, check_only: bool) -> Result<()> {
         None => latest_version().await?,
     };
     let newer = parse_version(&latest) > parse_version(CURRENT);
+    let p = crate::ui::out();
     if check_only {
         if newer {
-            println!("Update available: {CURRENT} -> {latest}. Run: mcp-hub update");
+            println!(
+                "{}Update available: {CURRENT} → {}. Run: {}",
+                p.warn(""),
+                p.green(&latest),
+                p.cyan("mcp-hub update")
+            );
         } else {
-            println!("mcp-hub {CURRENT} is up to date (latest release: {latest}).");
+            println!(
+                "{}mcp-hub {CURRENT} is up to date (latest release: {latest}).",
+                p.ok("")
+            );
         }
         return Ok(());
     }
     if target.is_none() && !newer {
-        println!("mcp-hub {CURRENT} is up to date (latest release: {latest}).");
+        println!(
+            "{}mcp-hub {CURRENT} is up to date (latest release: {latest}).",
+            p.ok("")
+        );
         return Ok(());
     }
     check_installed_by_installer()?;
-    println!("Updating mcp-hub {CURRENT} -> {latest}...");
+    println!(
+        "{}",
+        p.bold(format!("Updating mcp-hub {CURRENT} → {latest}"))
+    );
     run_installer(&latest).await
 }
 

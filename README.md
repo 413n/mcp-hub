@@ -63,38 +63,25 @@ the command that starts it. Check at any time with:
     mcp-hub check              # or: curl -s -o /dev/null -w '%{http_code}\n' http://127.0.0.1:3050/mcp (401 = running)
 
 **macOS:** the first time `mcp-hub` reads the Keychain, macOS asks for your
-password to let it: choose *Always Allow*. All of mcp-hub's secrets are in a
-single Keychain item, so it asks once. Updates do not ask again: release
-binaries are all signed with the same certificate (below), so macOS knows each
-new version as the same program. (Versions before 0.6 were not signed and asked
-after every update; installing the first signed one asks once more. Versions up
-to 0.4 kept one item per secret: the first time 0.5 or later needs one of those,
-macOS asks for it one last time while it moves into the single item.)
+password to let it: click *Always Allow* (pressing Return allows it only that
+once, and the hub asks again when it starts). All of mcp-hub's secrets are in a
+single Keychain item, so it asks once, and then not again until the next
+update: to the Keychain each new build is a new program (see below). (Versions
+up to 0.4 kept one item per secret: the first time 0.5 or later needs one of
+those, macOS asks for it one last time while it moves into the single item.)
 
 ### Signing on macOS
 
 Release binaries for macOS are signed with mcp-hub's own certificate,
-`mcp-hub release`. It is self-signed, not issued by Apple: it does not make
-macOS trust the binary any more (installed with `install.sh` it needs no
-trust), but it gives every release the same identity, which is what the
-Keychain's *Always Allow* is tied to. Check it with
-`codesign -dvv ~/.local/bin/mcp-hub` (`Authority=mcp-hub release`).
+`mcp-hub release` (check with `codesign -dvv ~/.local/bin/mcp-hub`). It is
+self-signed, not issued by Apple. It does not make macOS trust the binary any
+more (installed with `install.sh` it needs no trust), but it gives every release
+the same identity, so the permissions you give mcp-hub in *System Settings →
+Privacy & Security* (such as *Developer Tools*) stay after an update.
 
-Builds from a clone are not signed, so the Keychain asks after each
-`install-service.sh`. To stop that, make a certificate of your own, once (nothing
-to pay, and it never leaves the Mac):
-
-1. Open *Keychain Access*, then in the menu *Keychain Access → Certificate
-   Assistant → Create a Certificate…*
-2. Name: `mcp-hub`, Identity Type: *Self Signed Root*, Certificate Type: *Code
-   Signing*. Create.
-3. Run `bin/install-service.sh` again. macOS asks whether `codesign` may use the
-   new key, then the Keychain asks about mcp-hub once more: *Always Allow* both.
-
-From then on `install-service.sh` signs every build with it (also release
-binaries, if you install those on the same Mac: switching between the two
-certificates asks again). To use a certificate with another name:
-`MCP_HUB_SIGN=<name>`.
+It does not stop the Keychain from asking after each update: without a Team ID,
+which only a certificate from Apple's paid developer program has, the Keychain
+ties *Always Allow* to the exact build.
 
 ## 2. Connect your agents
 
@@ -271,7 +258,7 @@ stdio server, see [Local (stdio) servers](#local-stdio-servers)).
 
 Then restart the hub and check it:
 
-    mcp-hub status                     # ok/FAIL and tool count per server
+    mcp-hub status                     # tool count per server, or what is wrong
 
 Agents pick up the new tools on their next session (Claude Code: `/mcp` →
 reconnect; Cursor: toggle the server in settings).
@@ -408,6 +395,11 @@ How it runs:
     mcp-hub headers            # what agents run: the HTTP headers for the hub, as JSON
     mcp-hub update [--check]   # update to the latest release (one-line installs)
     mcp-hub update <version>   # install a specific version, e.g. to go back
+    mcp-hub help               # all commands
+
+On a terminal the output has colors and symbols; piped or redirected it is plain
+text (`status` then prints `ok`/`FAIL` per server, for scripts). `NO_COLOR=1`
+turns colors off everywhere, `CLICOLOR_FORCE=1` on.
 
 Restart after editing the config:
 
@@ -422,10 +414,9 @@ starts.
 
 Update: `mcp-hub update` for one-line installs (it runs that release's
 `install.sh`: checksum check, binary swap, service restart; config, logins and
-token stay). For a clone: `git pull && bin/install-service.sh`. On macOS a build
-from a clone has the Keychain ask once more after each update, during the
-install: choose *Always Allow* (or sign it, see
-[Signing on macOS](#signing-on-macos)).
+token stay). For a clone: `git pull && bin/install-service.sh`. On macOS the
+Keychain asks once more after each update, during the install: click *Always
+Allow* (see [Signing on macOS](#signing-on-macos)).
 
 `mcp-hub status` asks the running hub, which has the servers' logins at hand
 and checks them all at once; only when no hub runs does it connect to each
@@ -478,9 +469,11 @@ dropped when full; delete the directory to start over.
 - **`mcp-hub update` or `install-service.sh` says the hub is not running**: the
   new binary is in place; run the command it prints, then `mcp-hub check`. On
   macOS, look first for a Keychain dialog: the hub waits for it.
-- **One server missing**: `mcp-hub status`. A `FAIL` saying to log in means its
-  login is missing or expired: run `login` (or `set-token`) again.
-- **Local server FAIL "cannot start"**: the `command` path is wrong, or a bare
+- **One server missing**: `mcp-hub status`. A failure saying to log in means its
+  login is missing or expired: run `login` (or `set-token`) again. "Nothing
+  listens on" means the program that serves it is not running, such as a desktop
+  app that is closed.
+- **Local server fails with "cannot start"**: the `command` path is wrong, or a bare
   name is not in the service's `PATH` (see [Local (stdio) servers](#local-stdio-servers)).
   "connection closed: initialize response" means it started but exited: the
   `stderr:` part of the message usually says why.
@@ -544,10 +537,8 @@ dropped when full; delete the directory to start over.
 - The keyring is readable by any process running as you while you are logged in
   (on macOS, other apps get a prompt). It protects against disk theft and stray
   files, not against your own user.
-- On macOS, *Always Allow* lets any binary signed with the `mcp-hub release`
-  certificate (and identifier `dev.mcp-hub`) read mcp-hub's Keychain item
-  without asking. Its key is only in this repository's GitHub Actions secrets,
-  which sign the releases.
+- The key of the `mcp-hub release` signing certificate is only in this
+  repository's GitHub Actions secrets, which sign the releases.
 
 ## Development
 
@@ -591,6 +582,6 @@ workflow fails without them. They were made with:
     rm key.pem cert.pem pass sign.p12
 
 (The old PKCS#12 algorithms because macOS cannot read OpenSSL 3's default.) A
-new certificate, or later an Apple Developer ID one under another name (change
-`--sign` in the workflow), works the same; each Mac's Keychain asks once more
-after the first release signed with it.
+new certificate works the same, and so would an Apple Developer ID one (change
+the name in the workflow's `awk`; add notarization). That one has a Team ID, so
+the Keychain would stop asking after updates.

@@ -120,8 +120,9 @@ jobs:
 
       # Signed with mcp-hub's own self-signed certificate (secrets MACOS_SIGN_P12, base64 of
       # a PKCS#12 file, and MACOS_SIGN_PASSWORD; see "Releasing" in the README). Not trusted
-      # by Apple, and need not be: it gives every release the same identity, so the Keychain
-      # lets a new version in without asking again.
+      # by Apple, and need not be: it gives every release the same identity, so permissions
+      # given in Privacy & Security stay after an update. (Not the Keychain's: that needs an
+      # Apple Team ID.)
       - name: Sign
         if: runner.os == 'macOS'
         env:

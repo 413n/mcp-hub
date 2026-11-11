@@ -117,7 +117,11 @@ fn open_browser(url: &str) -> Result<()> {
             parsed.scheme()
         );
     }
-    println!("\nOpen this URL to log in (trying your browser now):\n\n  {url}\n");
+    let p = crate::ui::out();
+    println!(
+        "\nOpen this URL to log in (trying your browser now):\n\n  {}\n",
+        p.cyan(url)
+    );
     let opener = if cfg!(target_os = "macos") {
         "/usr/bin/open"
     } else {
@@ -182,6 +186,10 @@ pub async fn login(config: &Config, store: &SecretStore, name: &str) -> Result<(
     let tools = upstream.list_tools().await;
     upstream.close().await;
     let tools = tools?;
-    println!("Logged in to {name}: {} tools available.", tools.len());
+    println!(
+        "{}Logged in to {name}: {} tools available.",
+        crate::ui::out().ok(""),
+        tools.len()
+    );
     Ok(())
 }

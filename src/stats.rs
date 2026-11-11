@@ -316,14 +316,20 @@ fn n(value: &Value) -> u64 {
 pub fn render(s: &Value, all: bool) -> String {
     use std::fmt::Write;
     let list = |v: &Value| v.as_array().cloned().unwrap_or_default();
+    let p = crate::ui::out();
+    // A count of failures, red when there are any (padded first, so columns stay aligned).
+    let failed = |v: &Value, width: usize| {
+        let text = format!("{:>width$}", n(v));
+        if n(v) > 0 { p.red(text) } else { text }
+    };
     let mut out = String::new();
     let total = &s["total"];
     let _ = writeln!(
         out,
-        "Last {} days: {} tool calls ({} failed), {} characters of results (about {} tokens)",
-        n(&s["days"]),
+        "{} {} tool calls ({} failed), {} characters of results (about {} tokens)",
+        p.bold(format!("Last {} days:", n(&s["days"]))),
         n(&total["calls"]),
-        n(&total["failed"]),
+        failed(&total["failed"], 0),
         short(&total["totalChars"]),
         short(&json!(total["totalChars"].as_u64().unwrap_or(0) / 4)),
     );
@@ -341,17 +347,21 @@ pub fn render(s: &Value, all: bool) -> String {
     if !tools.is_empty() {
         let _ = writeln!(
             out,
-            "\nBy tool, largest total first (time in ms, results in characters)\n\
-             {:<44}{:>6}{:>7}{:>8}{:>9}{:>8}{:>9}{:>8}",
-            "", "calls", "failed", "median", "slowest", "median", "largest", "total"
+            "\n{} {}\n{}",
+            p.bold("By tool, largest total first"),
+            p.dim("(time in ms, results in characters)"),
+            p.dim(format!(
+                "{:<44}{:>6}{:>7}{:>8}{:>9}{:>8}{:>9}{:>8}",
+                "", "calls", "failed", "median", "slowest", "median", "largest", "total"
+            )),
         );
         for t in &tools {
             let _ = writeln!(
                 out,
-                "{:<44}{:>6}{:>7}{:>8}{:>9}{:>8}{:>9}{:>8}",
+                "{:<44}{:>6}{}{:>8}{:>9}{:>8}{:>9}{:>8}",
                 t["tool"].as_str().unwrap_or("?"),
                 n(&t["calls"]),
-                n(&t["failed"]),
+                failed(&t["failed"], 7),
                 n(&t["medianMs"]),
                 n(&t["slowestMs"]),
                 short(&t["medianChars"]),
@@ -362,33 +372,38 @@ pub fn render(s: &Value, all: bool) -> String {
     }
     let errors = list(&s["errors"]);
     if !errors.is_empty() {
-        let _ = writeln!(out, "\nFailures");
+        let _ = writeln!(out, "\n{}", p.bold("Failures"));
         for e in &errors {
             let (tool, error) = (e["tool"].as_str(), e["error"].as_str());
             let (tool, error) = (tool.unwrap_or("?"), error.unwrap_or("?"));
-            let _ = writeln!(out, "{:>5}x {tool}: {error}", n(&e["times"]));
+            let times = p.red(format!("{:>5}x", n(&e["times"])));
+            let _ = writeln!(out, "{times} {tool}: {error}");
         }
     }
     let agents = list(&s["agents"]);
     if !agents.is_empty() {
         let _ = writeln!(
             out,
-            "\nBy agent{:>36}{:>7}{:>11}",
-            "calls", "failed", "tool lists"
+            "\n{}{}",
+            p.bold("By agent"),
+            p.dim(format!(
+                "{:>36}{:>7}{:>11}",
+                "calls", "failed", "tool lists"
+            ))
         );
         for a in &agents {
             let name = a["agent"].as_str().unwrap_or("?");
             let _ = writeln!(
                 out,
-                "{name:<38}{:>6}{:>7}{:>11}",
+                "{name:<38}{:>6}{}{:>11}",
                 n(&a["calls"]),
-                n(&a["failed"]),
+                failed(&a["failed"], 7),
                 n(&a["toolLists"])
             );
         }
     }
     if let Some(servers) = s["servers"].as_object().filter(|s| !s.is_empty()) {
-        let _ = writeln!(out, "\nServers");
+        let _ = writeln!(out, "\n{}", p.bold("Servers"));
         for (server, counts) in servers {
             let counts = counts.as_object().into_iter().flatten();
             let counts: Vec<_> = counts.map(|(what, n)| format!("{what} {n}")).collect();
@@ -399,7 +414,8 @@ pub fn render(s: &Value, all: bool) -> String {
     if d.is_object() {
         let _ = writeln!(
             out,
-            "\nTool definitions now: {} tools, {} bytes (about {} tokens if all were loaded)",
+            "\n{} {} tools, {} bytes (about {} tokens if all were loaded)",
+            p.bold("Tool definitions now:"),
             n(&d["tools"]),
             short(&d["bytes"]),
             short(&json!(d["bytes"].as_u64().unwrap_or(0) / 4)),
@@ -422,7 +438,7 @@ pub fn render(s: &Value, all: bool) -> String {
                 short(&cut["bytesSaved"]),
             );
         }
-        let _ = writeln!(out, "Largest:");
+        let _ = writeln!(out, "{}", p.bold("Largest:"));
         for tool in list(&d["largest"]) {
             let name = tool["tool"].as_str().unwrap_or("?");
             let _ = writeln!(out, "{:>8}  {name}", short(&tool["bytes"]));
@@ -438,7 +454,7 @@ pub fn render(s: &Value, all: bool) -> String {
             let names: Vec<_> = unused.iter().filter_map(Value::as_str).collect();
             let _ = writeln!(out, "\n{}", names.join(" "));
         } else {
-            let _ = writeln!(out, " (--all lists them)");
+            let _ = writeln!(out, " {}", p.dim("(--all lists them)"));
         }
     } else {
         let _ = writeln!(

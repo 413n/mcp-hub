@@ -14,37 +14,109 @@ use mcp_hub::{
     oauth::{credential_keys, secret_env_key},
     secrets::SecretStore,
     stats::{self, Stats},
+    ui::{self, Paint},
     update,
     upstream::{Timings, Upstream},
 };
 use tokio_util::sync::CancellationToken;
 
-fn usage() -> String {
-    format!(
-        "usage: mcp-hub <command>
+/// The commands, in groups: (heading, [(command, what it does)]).
+const COMMANDS: &[(&str, &[(&str, &str)])] = &[
+    (
+        "The hub",
+        &[
+            ("serve", "run the proxy on http://127.0.0.1:<port>/mcp"),
+            ("status", "ask every upstream server for its tools"),
+            (
+                "check [--wait N]",
+                "whether the hub answers on its port, waiting up to N seconds",
+            ),
+            (
+                "stats [--days N] [--all] [--json]",
+                "what the hub did lately: calls, failures, result and definition sizes",
+            ),
+        ],
+    ),
+    (
+        "Upstream servers",
+        &[
+            (
+                "login <server>",
+                "log in to an OAuth server (opens your browser)",
+            ),
+            ("logout <server>", "delete stored credentials for a server"),
+            (
+                "set-token <server>",
+                "store a static bearer token for a \"bearer\" server",
+            ),
+            (
+                "set-token <server> <VAR>",
+                "store the value of VAR, one of a command server's \"secretEnv\"",
+            ),
+        ],
+    ),
+    (
+        "Agents",
+        &[
+            (
+                "connect",
+                "for an agent's config: MCP on stdin/stdout, forwarded to the hub",
+            ),
+            (
+                "headers",
+                "for an agent's config: the HTTP headers to send to the hub, as JSON",
+            ),
+            (
+                "token",
+                "print the hub's bearer token, creating it if needed",
+            ),
+            (
+                "token --rotate",
+                "replace the token; the running hub turns the old one down",
+            ),
+        ],
+    ),
+    (
+        "Updates",
+        &[
+            (
+                "update",
+                "update to the latest release (installs made by install.sh)",
+            ),
+            (
+                "update --check",
+                "only check whether a newer release exists",
+            ),
+            ("update <version>", "install that version (also to go back)"),
+            ("--version", "print the version"),
+        ],
+    ),
+];
 
-  serve               run the proxy on http://127.0.0.1:<port>/mcp
-  login <server>      log in to an OAuth upstream (opens your browser)
-  logout <server>     delete stored credentials for a server
-  set-token <server>  store a static bearer token (prompted, not echoed) for a \"bearer\" server
-  set-token <server> <VAR>
-                      store the value of VAR, one of a command server's \"secretEnv\" (same way)
-  status              connect to every upstream and count its tools
-  stats [--days N] [--all] [--json]
-                      what the hub did lately: calls, failures, result and definition sizes
-  token               print the inbound bearer token, creating it if needed
-  token --rotate      replace the inbound token; the running hub turns the old one down at once
-  connect             for an agent's config: MCP on stdin/stdout, forwarded to the running hub
-  headers             for an agent's config: print the HTTP headers to send to the hub, as JSON
-  check [--wait N]    whether the hub answers on its port, waiting up to N seconds for it
-  update              update to the latest release (installs made by install.sh)
-  update --check      only check whether a newer release exists
-  update <version>    install that version (also to go back)
-  --version           print the version
-
-config: {}",
+fn usage(p: Paint) -> String {
+    let mut out = format!(
+        "{} {}: one MCP endpoint for all your agents\n\n{} mcp-hub <command>\n",
+        p.bold("mcp-hub"),
+        env!("CARGO_PKG_VERSION"),
+        p.bold("Usage:"),
+    );
+    for (heading, commands) in COMMANDS {
+        out.push_str(&format!("\n{}\n", p.bold(heading)));
+        for (command, what) in *commands {
+            // A long command gets its own line.
+            if command.len() > 24 {
+                out.push_str(&format!("  {}\n  {:26}{what}\n", p.cyan(command), ""));
+            } else {
+                out.push_str(&format!("  {}{what}\n", p.cyan(format!("{command:26}"))));
+            }
+        }
+    }
+    out.push_str(&format!(
+        "\n{} {}",
+        p.bold("Config:"),
         config_path().display()
-    )
+    ));
+    out
 }
 
 fn upstreams(config: &Config, store: &SecretStore) -> Vec<Arc<Upstream>> {
@@ -133,52 +205,125 @@ async fn serve(config: Config, store: SecretStore) -> Result<()> {
     Ok(())
 }
 
+/// "1 tool", "2 tools".
+fn tools(n: usize) -> &'static str {
+    if n == 1 { "tool" } else { "tools" }
+}
+
+/// One server's line in `status`: its tool count, or what is wrong. `width` is that of the
+/// longest name.
+fn status_line(p: Paint, width: usize, name: &str, result: &Result<usize, String>) -> String {
+    if !p.on {
+        // Plain, as before colors: scripts may read it.
+        return match result {
+            Ok(n) => format!("ok    {name}: {n} tools"),
+            Err(e) => format!("FAIL  {name}: {e}"),
+        };
+    }
+    let name = p.bold(format!("{name:width$}"));
+    match result {
+        Ok(n) => format!("  {}{name}  {n:>3} {}", p.ok(""), p.dim(tools(*n))),
+        Err(e) => format!(
+            "  {}{name}  {}",
+            p.fail(""),
+            p.wrap(e, ui::width(), 2 + 2 + width + 2)
+        ),
+    }
+}
+
+/// The last line of `status` on a terminal: "3 ok, 1 failing · 70 tools".
+fn status_summary(p: Paint, results: &[Result<usize, String>]) -> String {
+    let failing = results.iter().filter(|r| r.is_err()).count();
+    let total: usize = results.iter().filter_map(|r| r.as_ref().ok()).sum();
+    let servers = if failing == 0 {
+        p.green(match results.len() {
+            1 => "the server is ok".to_owned(),
+            n => format!("all {n} servers ok"),
+        })
+    } else {
+        format!(
+            "{} ok, {}",
+            results.len() - failing,
+            p.red(format!("{failing} failing"))
+        )
+    };
+    format!("\n  {servers} {} {total} {}", p.dim("·"), tools(total))
+}
+
 /// `mcp-hub status`: asked of the running hub, which has the servers' credentials at hand;
 /// only if none runs does this connect to each server itself (and read each one's
 /// credentials from the keyring).
 async fn status(config: Config, store: SecretStore) -> Result<bool> {
+    let p = ui::out();
     let asked = match store.get(TOKEN_KEY).await? {
         Some(token) => http::status(config.port, &token).await,
         None => Ok(None),
     };
+    let mut results = Vec::new();
+    let note = |plain: String, styled: String| {
+        println!("{}", if p.on { styled } else { plain });
+    };
     match asked {
         Ok(Some(servers)) => {
-            let mut ok = true;
+            let width = servers.iter().map(|s| s.name.len()).max().unwrap_or(0);
             for server in &servers {
-                match (&server.tools, &server.error) {
-                    (Some(tools), _) => println!("ok    {}: {tools} tools", server.name),
-                    (None, error) => {
-                        ok = false;
-                        let error = error.as_deref().unwrap_or("no answer");
-                        println!("FAIL  {}: {error}", server.name);
-                    }
-                }
+                let result = match (server.tools, &server.error) {
+                    (Some(tools), _) => Ok(tools),
+                    (None, error) => Err(error.clone().unwrap_or_else(|| "no answer".into())),
+                };
+                println!("{}", status_line(p, width, &server.name, &result));
+                results.push(result);
             }
             let running: Vec<_> = servers.iter().map(|s| s.name.as_str()).collect();
             let configured: Vec<_> = config.servers.iter().map(|s| s.name.as_str()).collect();
             if running != configured {
-                println!(
-                    "The config changed since the hub started: restart it to apply ({}).",
-                    update::start_command()
+                let restart = update::start_command();
+                note(
+                    format!(
+                        "The config changed since the hub started: restart it to apply ({restart})."
+                    ),
+                    format!(
+                        "\n{}The config changed since the hub started. To apply it, restart it:\n    {}",
+                        p.warn(""),
+                        p.cyan(restart)
+                    ),
                 );
             }
-            return Ok(ok);
         }
-        Ok(None) => println!("(No hub running that can say: asking each server from here.)"),
-        Err(e) => println!("({e:#}: asking each server from here.)"),
+        Ok(None) => note(
+            "(No hub running that can say: asking each server from here.)".into(),
+            format!(
+                "{}No hub running: asking each server from here.\n",
+                p.warn("")
+            ),
+        ),
+        Err(e) => note(
+            format!("({e:#}: asking each server from here.)"),
+            format!("{}{e:#}: asking each server from here.\n", p.warn("")),
+        ),
     }
-    let mut ok = true;
-    for upstream in upstreams(&config, &store) {
-        match upstream.list_tools().await {
-            Ok(tools) => println!("ok    {}: {} tools", upstream.name(), tools.len()),
-            Err(e) => {
-                ok = false;
-                println!("FAIL  {}: {e}", upstream.name());
-            }
+    if results.is_empty() {
+        let width = config
+            .servers
+            .iter()
+            .map(|s| s.name.len())
+            .max()
+            .unwrap_or(0);
+        for upstream in upstreams(&config, &store) {
+            let result = upstream
+                .list_tools()
+                .await
+                .map(|tools| tools.len())
+                .map_err(|e| e.to_string());
+            println!("{}", status_line(p, width, upstream.name(), &result));
+            results.push(result);
+            upstream.close().await;
         }
-        upstream.close().await;
     }
-    Ok(ok)
+    if p.on && !results.is_empty() {
+        println!("{}", status_summary(p, &results));
+    }
+    Ok(results.iter().all(Result::is_ok))
 }
 
 /// `mcp-hub stats`: the record of the last days, and the tools the running hub lists.
@@ -230,20 +375,24 @@ async fn token(store: SecretStore, rotate: bool) -> Result<()> {
             Ok(config) => http::reload_token(config.port, &old).await,
             Err(e) => Err(e),
         };
+        let p = ui::err();
         match told {
-            Ok(http::Reloaded::Yes) => {
-                eprintln!("The running hub takes only the new token from now on.")
-            }
+            Ok(http::Reloaded::Yes) => eprintln!(
+                "{}The running hub takes only the new token from now on.",
+                p.ok("")
+            ),
             Ok(http::Reloaded::NotRunning) => {}
             Ok(http::Reloaded::TooOld) => eprintln!(
-                "The running hub is an older version and still takes the old token: \
+                "{}The running hub is an older version and still takes the old token: \
                  restart it with {}",
-                update::start_command()
+                p.warn(""),
+                p.cyan(update::start_command())
             ),
             Err(e) => eprintln!(
-                "mcp-hub: could not hand the new token to the running hub ({e:#}). \
+                "{}could not hand the new token to the running hub ({e:#}). \
                  Restart it with {}",
-                update::start_command()
+                p.warn("mcp-hub: "),
+                p.cyan(update::start_command())
             ),
         }
     }
@@ -259,25 +408,28 @@ async fn check(options: &[String]) -> Result<bool> {
         _ => bail!("usage: mcp-hub check [--wait N]"),
     };
     let port = load_config()?.port;
+    let p = ui::out();
     let deadline = std::time::Instant::now() + Duration::from_secs(wait);
     loop {
         let found = http::probe(port).await;
         if found == http::Probe::Hub {
-            println!("mcp-hub is running on http://127.0.0.1:{port}/mcp");
+            let url = format!("http://127.0.0.1:{port}/mcp");
+            println!("{}mcp-hub is running on {}", p.ok(""), p.cyan(url));
             return Ok(true);
         }
         if std::time::Instant::now() >= deadline {
-            match found {
-                http::Probe::Other(status) => println!(
+            let why = match found {
+                http::Probe::Other(status) => format!(
                     "Another program answers on 127.0.0.1:{port} (HTTP {status}), not mcp-hub: \
                      stop it, or give the hub another \"port\" in the config."
                 ),
-                http::Probe::Silent => println!(
+                http::Probe::Silent => format!(
                     "Something holds 127.0.0.1:{port} but does not answer: a hub that is still \
                      starting or waits for the keyring (on macOS, look for a Keychain dialog)."
                 ),
-                _ => println!("Nothing listens on 127.0.0.1:{port}: the hub is not running."),
-            }
+                _ => format!("Nothing listens on 127.0.0.1:{port}: the hub is not running."),
+            };
+            println!("{}{}", p.fail(""), p.wrap(&why, ui::width(), 2));
             return Ok(false);
         }
         tokio::time::sleep(Duration::from_secs(1)).await;
@@ -335,8 +487,11 @@ async fn set_token(
         }
     }
     if !missing.is_empty() {
+        let p = ui::out();
         println!(
-            "Stored {what} for {name}. Still to set: {}.",
+            "{}Stored {what} for {name}. {}Still to set: {}.",
+            p.ok(""),
+            p.warn(""),
             missing.join(", ")
         );
         return Ok(());
@@ -346,7 +501,12 @@ async fn set_token(
     upstream.close().await;
     match result {
         Ok(tools) => {
-            println!("Stored {what} for {name}: {} tools available.", tools.len());
+            let p = ui::out();
+            println!(
+                "{}Stored {what} for {name}: {} tools available.",
+                p.ok(""),
+                tools.len()
+            );
             Ok(())
         }
         Err(e) => {
@@ -363,7 +523,7 @@ async fn logout(config: Config, store: SecretStore, name: &str) -> Result<()> {
     for key in credential_keys(config.server(name)?) {
         store.delete(&key).await?;
     }
-    println!("Removed stored credentials for {name}.");
+    println!("{}Removed stored credentials for {name}.", ui::out().ok(""));
     Ok(())
 }
 
@@ -420,8 +580,9 @@ async fn run(args: &[String]) -> Result<ExitCode> {
         (Some("update"), Some("--check")) => update::update(None, true).await?,
         (Some("update"), Some(version)) => update::update(Some(version), false).await?,
         (Some("--version" | "version"), None) => println!("mcp-hub {}", env!("CARGO_PKG_VERSION")),
+        (Some("help" | "--help" | "-h"), None) => println!("{}", usage(ui::out())),
         _ => {
-            eprintln!("{}", usage());
+            eprintln!("{}", usage(ui::err()));
             return Ok(ExitCode::from(2));
         }
     }
@@ -430,10 +591,11 @@ async fn run(args: &[String]) -> Result<ExitCode> {
 
 fn init_logging(serving: bool) {
     use tracing_subscriber::EnvFilter;
+    // Other commands say themselves what failed: not what the hub's log would also say.
     let default = if serving {
         "info,rmcp=warn"
     } else {
-        "warn,rmcp=error"
+        "warn,rmcp=off,mcp_hub::upstream=error"
     };
     let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(default));
     let builder = tracing_subscriber::fmt()
@@ -497,7 +659,12 @@ fn main() -> ExitCode {
     match result {
         Ok(code) => code,
         Err(e) => {
-            eprintln!("mcp-hub: {e:#}");
+            let p = ui::err();
+            if p.on {
+                eprintln!("{}: {e:#}", p.red(p.bold("error")));
+            } else {
+                eprintln!("mcp-hub: {e:#}");
+            }
             ExitCode::FAILURE
         }
     }

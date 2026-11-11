@@ -960,3 +960,21 @@ async fn reports_status() {
     let free = http::bind(0).await.unwrap().local_addr().unwrap().port();
     assert!(http::status(free, TOKEN).await.unwrap().is_none());
 }
+
+#[tokio::test]
+async fn says_when_nothing_listens() {
+    let free = http::bind(0).await.unwrap().local_addr().unwrap().port();
+    let config = parse_config(
+        &json!({"servers": {"app": {"url": format!("http://127.0.0.1:{free}/mcp")}}}).to_string(),
+    )
+    .unwrap();
+    let upstream = Upstream::new(config.servers[0].clone(), SecretStore::memory());
+    let error = upstream.list_tools().await.unwrap_err().to_string();
+    assert_eq!(
+        error,
+        format!(
+            "nothing listens on 127.0.0.1:{free} (connection refused): \
+             is the program that serves it running?"
+        )
+    );
+}

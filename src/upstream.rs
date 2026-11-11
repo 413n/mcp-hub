@@ -16,7 +16,7 @@ use rmcp::{
         CallToolRequestParams, CallToolResponse, ClientCapabilities, ClientConfig, ClientRequest,
         Implementation, Tool,
     },
-    service::{NotificationContext, RunningService},
+    service::{ClientInitializeError, NotificationContext, RunningService},
     transport::{
         StreamableHttpClientTransport, TokioChildProcess,
         auth::{AuthClient, AuthorizationManager},
@@ -132,6 +132,63 @@ pub enum UpstreamError {
     Mcp(rmcp::ErrorData),
     #[error("{0}")]
     Other(String),
+}
+
+/// Why connecting failed, in words. rmcp's own message names its transport's types and leaves
+/// out the cause underneath, such as "connection refused".
+fn explain(e: &ClientInitializeError) -> String {
+    use rmcp::transport::streamable_http_client::StreamableHttpError;
+    let ClientInitializeError::TransportError { error, .. } = e else {
+        return e.to_string();
+    };
+    let error: &(dyn std::error::Error + 'static) = &*error.error;
+    match error.downcast_ref::<StreamableHttpError<reqwest::Error>>() {
+        Some(StreamableHttpError::Client(e)) => explain_http(e),
+        _ => with_causes(error),
+    }
+}
+
+fn explain_http(e: &reqwest::Error) -> String {
+    let at = e.url().map_or_else(String::new, |url| {
+        let host = url.host_str().unwrap_or("?");
+        match url.port_or_known_default() {
+            Some(port) => format!("{host}:{port}"),
+            None => host.to_owned(),
+        }
+    });
+    let mut causes = std::iter::successors(std::error::Error::source(e), |e| e.source());
+    let refused = causes.any(|cause| {
+        cause
+            .downcast_ref::<std::io::Error>()
+            .is_some_and(|io| io.kind() == std::io::ErrorKind::ConnectionRefused)
+    });
+    if refused {
+        format!(
+            "nothing listens on {at} (connection refused): is the program that serves it running?"
+        )
+    } else if e.is_timeout() {
+        format!("{at} did not answer in time")
+    } else if e.is_connect() {
+        let cause = std::iter::successors(std::error::Error::source(e), |e| e.source()).last();
+        match cause {
+            Some(cause) => format!("cannot connect to {at}: {cause}"),
+            None => format!("cannot connect to {at}"),
+        }
+    } else {
+        with_causes(e)
+    }
+}
+
+/// An error and what caused it, as "error: cause: its cause".
+fn with_causes(e: &(dyn std::error::Error + 'static)) -> String {
+    let mut text = e.to_string();
+    for cause in std::iter::successors(e.source(), |e| e.source()) {
+        let cause = cause.to_string();
+        if !text.contains(&cause) {
+            text = format!("{text}: {cause}");
+        }
+    }
+    text
 }
 
 /// The HTTP client for an upstream at `url`. There are two, shared by all upstreams.
@@ -470,7 +527,7 @@ impl Upstream {
             Err(e) => {
                 // The failed handshake dropped the transport, which kills the process; what it
                 // printed last usually says why it did not start.
-                let mut message = e.to_string();
+                let mut message = explain(&e);
                 if let Some(task) = stderr
                     && let Ok(Ok(tail)) = tokio::time::timeout(Duration::from_secs(2), task).await
                     && !tail.is_empty()
@@ -534,7 +591,7 @@ impl Upstream {
             if e.is_authorization_required() {
                 UpstreamError::NeedsLogin(format!("login expired, run \"mcp-hub login {name}\""))
             } else {
-                other(&e)
+                UpstreamError::Other(explain(&e))
             }
         })
     }

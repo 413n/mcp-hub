@@ -10,6 +10,7 @@ pub mod oauth;
 pub mod results;
 pub mod secrets;
 pub mod stats;
+pub mod ui;
 pub mod update;
 pub mod upstream;
 

@@ -14,30 +14,25 @@
 #   MCP_HUB_BIN      where to install the binary (from a clone: built, then copied there)
 #   MCP_HUB_CONFIG, MCP_HUB_STATE
 #                    passed on to the service (use a config with another port)
-# On macOS, MCP_HUB_SIGN names a certificate of your own to sign the binary with (default:
-# mcp-hub; see "Signing on macOS" in the README). Without one the binary keeps its signature:
-# release binaries are signed, builds from a clone are not.
 set -euo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 OS="$(uname -s)"
-SIGN_AS="${MCP_HUB_SIGN:-mcp-hub}"
 
-# macOS: sign binary $1 with your own certificate, if there is one, so that the Keychain
-# knows each new version as the same program and does not ask again.
-sign() {
-  [[ "$OS" == Darwin ]] || return 0
-  # Without -v: a self-signed certificate is not "valid" (trusted), and need not be.
-  security find-identity -p codesigning 2>/dev/null | grep -qF "\"$SIGN_AS\"" || return 0
-  codesign --force --sign "$SIGN_AS" --identifier dev.mcp-hub "$1" ||
-    echo "Warning: could not sign $1 with the certificate \"$SIGN_AS\"." >&2
-}
+# Color on a terminal only (and not with NO_COLOR), as mcp-hub itself.
+if [[ -t 1 && -z "${NO_COLOR:-}" && "${TERM:-}" != dumb ]]; then
+  DIM=$'\e[2m' BOLD=$'\e[1m' YELLOW=$'\e[33m' RESET=$'\e[0m'
+else
+  DIM="" BOLD="" YELLOW="" RESET=""
+fi
+if [[ -t 2 && -z "${NO_COLOR:-}" && "${TERM:-}" != dumb ]]; then
+  ERR_RED=$'\e[31m' ERR_BOLD=$'\e[1m' ERR_RESET=$'\e[0m'
+else
+  ERR_RED="" ERR_BOLD="" ERR_RESET=""
+fi
 
-# Whether $BIN is signed with a certificate (not only ad hoc, as builds are by default).
-signed() { codesign --display --verbose=2 "$BIN" 2>&1 | grep -q '^Authority='; }
-
-# Put binary $1 in place as $BIN: copy to a temp name, sign, and rename, so a running
-# service keeps its old binary until restarted.
+# Put binary $1 in place as $BIN: copy to a temp name and rename, so a running service keeps
+# its old binary until restarted.
 place() {
   mkdir -p "$(dirname "$BIN")"
   install -m 0755 "$1" "$BIN.new"
@@ -45,7 +40,6 @@ place() {
     # Archives downloaded with a browser are quarantined, which blocks unsigned binaries.
     xattr -d com.apple.quarantine "$BIN.new" 2>/dev/null || true
   fi
-  sign "$BIN.new"
   mv -f "$BIN.new" "$BIN"
 }
 
@@ -72,19 +66,15 @@ else
   else
     cargo install --path "$ROOT" --locked --quiet
     BIN="${CARGO_HOME:-$HOME/.cargo}/bin/mcp-hub"
-    # Sign a copy rather than the file a running hub may have been started from.
-    if [[ "$OS" == Darwin ]]; then place "$BIN"; fi
   fi
 fi
 [[ -x "$BIN" ]] || { echo "expected the binary at $BIN" >&2; exit 1; }
 "$BIN" --version >/dev/null || { echo "$BIN does not run on this machine" >&2; exit 1; }
 # The service waits for the hub token: create it if missing. On macOS this is also where the
-# Keychain asks whether the new binary may read it.
+# Keychain asks whether the new binary may read it: each build is a new program to it.
 if [[ "$OS" == Darwin ]]; then
-  echo "If macOS asks for your password to let mcp-hub use the Keychain: choose Always Allow."
-  if ! signed; then
-    echo "(It asks after every update. To stop that, see \"Signing on macOS\" in the README.)"
-  fi
+  echo "${YELLOW}!${RESET} If macOS asks for your password so that mcp-hub can use the Keychain, click"
+  echo "  ${BOLD}Always Allow${RESET} (pressing Return allows it only this once, and the hub would ask again)."
 fi
 "$BIN" token >/dev/null
 
@@ -114,7 +104,7 @@ trap 'rm -f "$ENV_FILE" "$NEW"' EXIT
 # Say how to start the hub by hand, and fail.
 not_running() {
   echo "" >&2
-  echo "mcp-hub: $BIN is installed, but the hub is not running." >&2
+  echo "${ERR_RED}${ERR_BOLD}✗${ERR_RESET} $BIN is installed, but the hub is not running." >&2
   if [[ -n "${1:-}" ]]; then echo "$1" >&2; fi
   echo "Start it with:" >&2
   echo "  $START" >&2
@@ -136,7 +126,7 @@ case "$OS" in
     systemctl --user enable "$NAME"
     # Waits for the old process to exit (TimeoutStopSec) before it starts the new one.
     systemctl --user restart "$NAME" || not_running
-    echo "Installed $UNIT (binary: $BIN)"
+    echo "${DIM}Installed $UNIT (binary: $BIN)${RESET}"
     ;;
   Darwin)
     LABEL="${MCP_HUB_SERVICE:-dev.mcp-hub}"
@@ -189,7 +179,7 @@ case "$OS" in
         sleep "$tries"
       done
     fi
-    echo "Installed $PLIST (binary: $BIN)"
+    echo "${DIM}Installed $PLIST (binary: $BIN)${RESET}"
     ;;
   *)
     echo "unsupported OS: $OS" >&2
@@ -202,4 +192,4 @@ if ! why="$("$BIN" check --wait 30)"; then
   not_running "It did not answer within 30s. $why"
 fi
 "$BIN" check
-echo "Logs: $LOGS"
+echo "  ${DIM}Logs: $LOGS${RESET}"
