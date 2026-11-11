@@ -78,7 +78,7 @@ Release binaries for macOS are signed with mcp-hub's own certificate,
 macOS trust the binary any more (installed with `install.sh` it needs no
 trust), but it gives every release the same identity, which is what the
 Keychain's *Always Allow* is tied to. Check it with
-`codesign -dv ~/.local/bin/mcp-hub` (`Authority=mcp-hub release`).
+`codesign -dvv ~/.local/bin/mcp-hub` (`Authority=mcp-hub release`).
 
 Builds from a clone are not signed, so the Keychain asks after each
 `install-service.sh`. To stop that, make a certificate of your own, once (nothing
