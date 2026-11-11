@@ -26,36 +26,39 @@ pub fn parse_version(v: &str) -> Option<(u64, u64, u64)> {
     parts.next().is_none().then_some(version)
 }
 
+/// Follows redirects: a renamed or transferred repository answers its old
+/// address with a redirect to the new one.
 fn http() -> Result<reqwest::Client> {
     Ok(reqwest::Client::builder()
         .user_agent(concat!("mcp-hub/", env!("CARGO_PKG_VERSION")))
-        .redirect(reqwest::redirect::Policy::none())
         .timeout(std::time::Duration::from_secs(30))
         .build()?)
 }
 
-/// The latest release's version, from the redirect of `<releases>/latest` to `.../tag/v<version>`.
+/// The latest release's version.
 pub async fn latest_version() -> Result<String> {
-    let url = format!("{}/latest", releases_url());
+    latest_version_at(&releases_url()).await
+}
+
+/// `<releases>/latest` redirects to `.../releases/tag/v<version>`, possibly after
+/// a redirect to the repository's new address; the version is read from where it ends.
+async fn latest_version_at(releases: &str) -> Result<String> {
+    let url = format!("{releases}/latest");
     let res = http()?
-        .get(&url)
+        .head(&url)
         .send()
         .await
         .with_context(|| format!("cannot reach {url}"))?;
-    let location = res
-        .headers()
-        .get(reqwest::header::LOCATION)
-        .and_then(|l| l.to_str().ok())
-        .with_context(|| format!("no release found at {url} (HTTP {})", res.status()))?;
-    let version = location
-        .rsplit('/')
-        .next()
-        .unwrap_or_default()
-        .trim_start_matches('v');
-    if parse_version(version).is_none() {
-        bail!("unexpected latest-release redirect: {location}");
+    let end = res.url();
+    match end.path().rsplit_once("/tag/") {
+        Some((_, tag)) if parse_version(tag).is_some() => {
+            Ok(tag.trim_start_matches('v').to_owned())
+        }
+        _ => bail!(
+            "no release found at {url} (HTTP {}, ended at {end})",
+            res.status()
+        ),
     }
-    Ok(version.to_owned())
 }
 
 /// Where install.sh puts the binary.
@@ -177,7 +180,50 @@ pub async fn update(target: Option<&str>, check_only: bool) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::parse_version;
+    use super::{latest_version_at, parse_version};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    /// Answers like GitHub for a repository moved from `old/hub` to `new/hub`,
+    /// where `new/hub` has release v1.2.3 and `empty/hub` has none.
+    async fn fake_github() -> String {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            loop {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let mut buf = vec![0; 4096];
+                let n = socket.read(&mut buf).await.unwrap();
+                let request = String::from_utf8_lossy(&buf[..n]);
+                let path = request.split_whitespace().nth(1).unwrap_or_default();
+                let head = match path {
+                    "/old/hub/releases/latest" => {
+                        "301 Moved Permanently\r\nLocation: /new/hub/releases/latest".to_owned()
+                    }
+                    "/new/hub/releases/latest" => {
+                        "302 Found\r\nLocation: /new/hub/releases/tag/v1.2.3".to_owned()
+                    }
+                    "/empty/hub/releases/latest" => {
+                        "302 Found\r\nLocation: /empty/hub/releases".to_owned()
+                    }
+                    _ => "200 OK".to_owned(),
+                };
+                let response =
+                    format!("HTTP/1.1 {head}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
+                let _ = socket.write_all(response.as_bytes()).await;
+            }
+        });
+        format!("http://{addr}")
+    }
+
+    #[tokio::test]
+    async fn latest_version_follows_a_moved_repository() {
+        let base = fake_github().await;
+        let at = |repo: &str| format!("{base}/{repo}/releases");
+        assert_eq!(latest_version_at(&at("new/hub")).await.unwrap(), "1.2.3");
+        assert_eq!(latest_version_at(&at("old/hub")).await.unwrap(), "1.2.3");
+        let err = latest_version_at(&at("empty/hub")).await.unwrap_err();
+        assert!(err.to_string().starts_with("no release found"), "{err}");
+    }
 
     #[test]
     fn versions() {
