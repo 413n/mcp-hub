@@ -1,5 +1,5 @@
 # Manual release: Actions → Release → Run workflow
-# (or: gh workflow run release.yml -R 413n/mcp-hub).
+# (or: gh workflow run release.yml -R narcisoaf/mcp-hub).
 #
 # Publishes GitHub Release v<version> (version from Cargo.toml) with one archive
 # per platform. Flow: create a draft release → build, test and upload on each

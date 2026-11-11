@@ -1,7 +1,7 @@
 #!/bin/sh
 # One-line installer for mcp-hub (Linux x86_64, macOS):
 #
-#   curl -fsSL https://raw.githubusercontent.com/413n/mcp-hub/main/install.sh | sh
+#   curl -fsSL https://raw.githubusercontent.com/narcisoaf/mcp-hub/main/install.sh | sh
 #
 # Downloads the latest release (or $MCP_HUB_VERSION, e.g. "0.1.0"), verifies its
 # SHA-256 checksum, installs the binary to ~/.local/bin and starts the hub as a
@@ -10,7 +10,7 @@
 # Your config and keyring entries are never touched.
 set -eu
 
-REPO="413n/mcp-hub"
+REPO="narcisoaf/mcp-hub"
 RELEASES="${MCP_HUB_RELEASES:-https://github.com/$REPO/releases}"
 
 say() { printf '%s\n' "$*"; }

@@ -25,7 +25,7 @@ normal desktop session.
 
 ### One-line install (Linux x86_64, macOS)
 
-    curl -fsSL https://raw.githubusercontent.com/413n/mcp-hub/main/install.sh | sh
+    curl -fsSL https://raw.githubusercontent.com/narcisoaf/mcp-hub/main/install.sh | sh
 
 [`install.sh`](install.sh) downloads the latest release for your platform,
 verifies its SHA-256 checksum, installs the binary to `~/.local/bin/mcp-hub`,
@@ -37,14 +37,14 @@ entries are never touched. Add `~/.local/bin` to your `PATH` to run `mcp-hub`
 directly (the rest of this README assumes it).
 
 Prefer to look first? Download the archive from the
-[Releases](https://github.com/413n/mcp-hub/releases) page, unpack it and run its
+[Releases](https://github.com/narcisoaf/mcp-hub/releases) page, unpack it and run its
 `./install-service.sh` yourself.
 
 ### From source
 
 Needs Rust (stable, 1.88+): `curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh`.
 
-    git clone https://github.com/413n/mcp-hub ~/Code/mcp-hub
+    git clone https://github.com/narcisoaf/mcp-hub ~/Code/mcp-hub
     cd ~/Code/mcp-hub
     mkdir -p ~/.config/mcp-hub
     [ -f ~/.config/mcp-hub/config.json ] || cp config.example.json ~/.config/mcp-hub/config.json
@@ -560,7 +560,7 @@ and its plist.
 ### Releasing
 
 1. Bump `version` in `Cargo.toml` (and run `cargo build` so `Cargo.lock` follows), commit, push.
-2. GitHub → Actions → **Release** → *Run workflow* (or `gh workflow run release.yml -R 413n/mcp-hub`).
+2. GitHub → Actions → **Release** → *Run workflow* (or `gh workflow run release.yml -R narcisoaf/mcp-hub`).
 
 The workflow (`.github/workflows/release.yml`) creates a draft release, then on
 Linux and macOS in parallel runs the tests, builds the `linux-x86_64` and

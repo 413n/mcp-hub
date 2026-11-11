@@ -9,7 +9,7 @@ use std::process::{Command, Stdio};
 
 use anyhow::{Context, Result, bail};
 
-const REPO: &str = "413n/mcp-hub";
+const REPO: &str = "narcisoaf/mcp-hub";
 
 pub const CURRENT: &str = env!("CARGO_PKG_VERSION");
 
